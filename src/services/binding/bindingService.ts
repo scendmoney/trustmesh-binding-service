@@ -20,6 +20,9 @@ export class BindingService {
             }
 
             if (proof.type === 'magic_jwt') {
+                if (config.MAGIC_JWT_ENABLED !== 'true') {
+                    throw new Error('magic_jwt proof type is disabled');
+                }
                 // For v0, we assume the JWT is validated by an upstream gateway or passed as a trusted token.
                 // In a real implementation, we would use Magic Admin SDK to validate.
                 // If MAGIC_PUBLIC_KEY is set, we could do basic signature verification.

@@ -13,6 +13,8 @@ const envSchema = z.object({
     IDENTITY_TOPIC_ID: z.string().min(1),
     MAGIC_PUBLIC_KEY: z.string().optional(),
     BINDING_SHARED_SECRET: z.string().optional(),
+    RESOLVE_MAX_PAGES: z.coerce.number().default(25),
+    MAGIC_JWT_ENABLED: z.enum(['true', 'false']).default('false'),
     CORS_ORIGINS: z.string().default('*'),
 });
 
