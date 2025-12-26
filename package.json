@@ -1,43 +1,42 @@
 {
-    "name": "trustmesh-binding-service",
-    "version": "1.0.0",
-    "description": "Minimal identity binding service for TrustMesh ecosystem",
-    "main": "dist/index.js",
-    "scripts": {
-        "build": "tsc",
-        "predev": "tsc",
-        "dev": "node dist/server.js",
-        "start": "node dist/server.js",
-        "test": "npx jest"
-    },
-    "keywords": [
-        "hedera",
-        "trustmesh",
-        "identity"
-    ],
-    "author": "TrustMesh",
-    "license": "MIT",
-    "dependencies": {
-        "@hashgraph/sdk": "^2.51.0",
-        "cors": "^2.8.5",
-        "dotenv": "^16.4.5",
-        "ethers": "^6.13.2",
-        "express": "^4.21.0",
-        "express-rate-limit": "^7.4.0",
-        "helmet": "^7.1.0",
-        "zod": "^3.23.8"
-    },
-    "devDependencies": {
-        "@types/cors": "^2.8.17",
-        "@types/express": "^4.17.21",
-        "@types/jest": "^29.5.12",
-        "@types/node": "^22.5.4",
-        "jest": "^29.7.0",
-        "ts-jest": "^29.2.4",
-        "typescript": "^5.5.4"
-    },
-      "packageManager": "pnpm@10.26.1",
-	  "engines": {
-	    "node": "20.x"
+  "name": "trustmesh-binding-service",
+  "version": "1.0.0",
+  "description": "Minimal identity binding service for TrustMesh ecosystem",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "predev": "tsc",
+    "dev": "node dist/server.js",
+    "start": "node dist/server.js",
+    "test": "npx jest"
+  },
+  "keywords": [
+    "hedera",
+    "trustmesh",
+    "identity"
+  ],
+  "author": "TrustMesh",
+  "license": "MIT",
+  "dependencies": {
+    "@hashgraph/sdk": "^2.51.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "ethers": "^6.13.2",
+    "express": "^4.21.0",
+    "express-rate-limit": "^7.4.0",
+    "helmet": "^7.1.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/express": "^4.17.21",
+    "@types/jest": "^29.5.12",
+    "@types/node": "^22.5.4",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.2.4",
+    "typescript": "^5.5.4"
+  },
+  "engines": {
+    "node": "20.x"
   }
 }
