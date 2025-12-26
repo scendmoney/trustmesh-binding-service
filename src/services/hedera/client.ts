@@ -32,7 +32,7 @@ export const submitToTopic = async (topicId: string, message: string) => {
             status: 'SUCCESS',
             transactionId: tx.transactionId.toString(),
             topicSequenceNumber: receipt.topicSequenceNumber?.toString(),
-            consensusTimestamp: receipt.consensusTimestamp?.toString()
+            consensusTimestamp: null,
         };
     } catch (error) {
         log.error('Failed to submit to topic', error, { topicId });
