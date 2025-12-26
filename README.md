@@ -1,3 +1,4 @@
+
 # TrustMesh Binding Service
 
 A dedicated, minimal identity binding oracle for the TrustMesh ecosystem.
@@ -24,59 +25,36 @@ pnpm dev
 ```
 
 ## 🔌 API Endpoints
+(See code or State of the Union for detailed schemas)
 
-### `GET /health`
-Returns service status.
-```json
-{ "ok": true, "service": "trustmesh-binding-service", "version": "1.0.0" }
-```
-
-### `GET /v1/resolve`
-Resolve an EVM address to a Hedera Account ID.
-**Query Params:** `worldId`, `evm`
-```json
-// Found
-{
-  "worldId": "labworld1",
-  "evm": "0x123...",
-  "hederaAccountId": "0.0.123",
-  "bindingEventId": "0.0.999:5",
-  "updatedAt": 1700000000000
-}
-
-// Not Found
-{
-  "worldId": "labworld1",
-  "evm": "0x123...",
-  "hederaAccountId": null,
-  "bindingEventId": null,
-  "updatedAt": null
-}
-```
-
-### `POST /v1/bind`
-Create a new identity binding (Oracle Write).
-**Headers:** `Content-Type: application/json`
-**Body:**
-```json
-{
-  "worldId": "labworld1",
-  "evmAddress": "0x123...",
-  "hederaAccountId": "0.0.456",
-  "proof": {
-    "type": "otp_attestation",
-    "value": "your-shared-secret"
-  }
-}
-```
+- `GET /health`
+- `GET /v1/resolve`
+- `GET /v1/status`
+- `POST /v1/bind`
 
 ## 🔒 Security
 - **Rate Limiting:** Global 60 req/min, Write 10 req/min.
 - **Fail Safe:** Returns `null` on resolution failure, does not crash.
 - **Oracle Pattern:** Only the server holds the Hedera Operator Key.
+- **Magic JWT:** Disabled by default. Set `MAGIC_JWT_ENABLED=true` only if proper verification is added.
 
 ## 🌍 Deployment
-Designed for `binding.trustmesh.app`.
+
+### Vercel
+Designed to deploy to `binding.trustmesh.app`.
+1.  Import repo to Vercel.
+2.  Set Framework to "Other" (or handle automatically via `api/index.ts`).
+3.  Add Environment Variables:
+    - `HEDERA_NETWORK` (testnet/mainnet)
+    - `HEDERA_OPERATOR_ID`
+    - `HEDERA_OPERATOR_KEY`
+    - `MIRROR_NODE_URL`
+    - `IDENTITY_TOPIC_ID`
+    - `BINDING_SHARED_SECRET`
+    - `RESOLVE_MAX_PAGES` (default 25)
+    - `MAGIC_JWT_ENABLED` (default false)
+
+### Docker / VPS
 - Set `NODE_ENV=production`.
 - Ensure all ENV vars are injected.
 - Expose PORT 3002.
