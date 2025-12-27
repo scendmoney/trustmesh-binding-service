@@ -1,7 +1,12 @@
-import { createApp } from "../src/app";
+import type { VercelRequest, VercelResponse } from '@vercel/node'
+import { createApp } from '../src/app'
 
-// create the express app once
-const app = createApp();
+const app = createApp()
 
-// Vercel will route /api/* to this file because of [...path]
-export default app;
+export default function handler(req: VercelRequest, res: VercelResponse) {
+  const parts = req.query.path
+  const path = Array.isArray(parts) ? parts.join('/') : (parts ?? '')
+  const qs = req.url?.includes('?') ? req.url.slice(req.url.indexOf('?')) : ''
+  req.url = '/' + path + qs
+  return (app as any)(req, res)
+}
