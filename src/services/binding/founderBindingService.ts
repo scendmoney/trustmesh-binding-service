@@ -141,8 +141,12 @@ const matchesFounder = (
 const fetchTopicPage = async (
     nextLink?: string
 ): Promise<{ messages: any[]; next?: string }> => {
+    const baseUrl = config.MIRROR_NODE_URL.endsWith('/')
+        ? config.MIRROR_NODE_URL
+        : `${config.MIRROR_NODE_URL}/`;
+
     const url = nextLink
-        ? `${config.MIRROR_NODE_URL}${nextLink}`
+        ? new URL(nextLink, baseUrl).toString()
         : `${config.MIRROR_NODE_URL}/topics/${config.IDENTITY_TOPIC_ID}/messages?limit=100&order=desc`;
 
     const controller = new AbortController();
@@ -349,3 +353,4 @@ export class FounderBindingService {
         }
     }
 }
+
