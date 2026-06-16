@@ -27,7 +27,8 @@ type TopicMatch = {
 
 const bindingCache = new Map<string, CacheEntry>();
 
-const normalize = (value: string): string => value.trim().toLowerCase();
+const normalize = (value: string | null | undefined): string =>
+  typeof value === "string" ? value.trim().toLowerCase() : "";
 
 const unbound = (
     reason: FounderBindingFailureResponse['reason'],
