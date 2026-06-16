@@ -6,6 +6,7 @@ import { config } from './config';
 import { log } from './util/log';
 import { ResolveService } from './services/binding/resolveService';
 import { BindingService } from './services/binding/bindingService';
+import { FounderBindingService } from './services/binding/founderBindingService';
 import { z } from 'zod';
 
 export const createApp = () => {
@@ -39,6 +40,36 @@ export const createApp = () => {
         })
     });
 
+    const founderBindingSchema = z.object({
+        founder: z.object({
+            issuer: z.string().min(1),
+            stableIdentifier: z.string().min(1),
+            canonicalDid: z.string().min(1),
+            displayName: z.string().min(1).optional(),
+            email: z.string().email().optional(),
+            evmPublicAddress: z.string().regex(/^0x[a-fA-F0-9]{40}$/).optional()
+        }),
+        claimIntent: z.object({
+            claimVersion: z.literal('v0.1'),
+            claimId: z.string().min(1),
+            requestedAt: z.string().min(1),
+            organismId: z.string().min(1),
+            sourceAssessmentId: z.string().min(1),
+            sourceIntakeId: z.string().min(1),
+            sourceReportId: z.string().min(1),
+            sourceCompilerRunId: z.string().min(1),
+            requestedRole: z.literal('foundingSteward')
+        })
+    });
+
+    const requireWorldsBuilderToken = (req: express.Request): boolean => {
+        if (!config.WORLDS_BUILDER_SERVICE_TOKEN) {
+            return true;
+        }
+
+        return req.header('x-worlds-builder-service-token') === config.WORLDS_BUILDER_SERVICE_TOKEN;
+    };
+
     // Routes
 
     // 1. Health
@@ -53,7 +84,7 @@ export const createApp = () => {
 
         if (!worldId || !evm) {
             res.status(400).json({ error: 'Missing worldId or evm' });
-            return
+            return;
         }
 
         const result = await ResolveService.resolve(worldId, evm);
@@ -67,7 +98,7 @@ export const createApp = () => {
 
         if (!worldId || !a) {
             res.status(400).json({ error: 'Missing parameters' });
-            return
+            return;
         }
 
         // Check binding for 'a'
@@ -103,6 +134,43 @@ export const createApp = () => {
         }
     });
 
+    app.post('/v2/founder-binding/resolve-or-provision', writeLimiter, async (req, res) => {
+        if (!requireWorldsBuilderToken(req)) {
+            res.status(401).json({
+                status: 'unbound',
+                reason: 'unauthorized',
+                message: 'Missing or invalid Worlds Builder service token.'
+            });
+            return;
+        }
+
+        try {
+            const body = founderBindingSchema.parse(req.body);
+            const result = await FounderBindingService.resolveOrProvision(body);
+
+            if (result.status === 'unbound' && result.reason === 'conflict') {
+                res.status(409).json(result);
+                return;
+            }
+
+            res.status(result.status === 'bound' ? 200 : 503).json(result);
+        } catch (error) {
+            if (error instanceof z.ZodError) {
+                res.status(400).json({
+                    error: 'Invalid founder binding input',
+                    details: error.errors
+                });
+                return;
+            }
+
+            log.error('Founder binding route error', error);
+            res.status(500).json({
+                status: 'unbound',
+                reason: 'serviceUnavailable',
+                message: 'Founder binding route failed.'
+            });
+        }
+    });
+
     return app;
 };
-

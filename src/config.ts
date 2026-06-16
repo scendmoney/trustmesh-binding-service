@@ -13,9 +13,13 @@ const envSchema = z.object({
     IDENTITY_TOPIC_ID: z.string().min(1),
     MAGIC_PUBLIC_KEY: z.string().optional(),
     BINDING_SHARED_SECRET: z.string().optional(),
+    WORLDS_BUILDER_SERVICE_TOKEN: z.string().optional(),
     RESOLVE_MAX_PAGES: z.coerce.number().default(25),
     MAGIC_JWT_ENABLED: z.enum(['true', 'false']).default('false'),
     CORS_ORIGINS: z.string().default('*'),
+    MIRROR_NODE_TIMEOUT_MS: z.coerce.number().default(4000),
+    HEDERA_ALIAS_POLL_ATTEMPTS: z.coerce.number().default(12),
+    HEDERA_ALIAS_POLL_DELAY_MS: z.coerce.number().default(750),
 });
 
 const parseEnv = () => {
