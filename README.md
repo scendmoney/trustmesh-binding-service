@@ -49,9 +49,14 @@ Designed to deploy to `binding.trustmesh.app`.
     - `HEDERA_OPERATOR_ID`
     - `HEDERA_OPERATOR_KEY`
     - `MIRROR_NODE_URL`
+    - `MIRROR_NODE_AUTH_TYPE` (`none`, `bearer`, or `x-api-key`)
+    - `MIRROR_NODE_AUTH_TOKEN` (required when auth type is not `none`)
     - `IDENTITY_TOPIC_ID`
     - `BINDING_SHARED_SECRET`
     - `RESOLVE_MAX_PAGES` (default 25)
+    - `MIRROR_NODE_TIMEOUT_MS`
+    - `HEDERA_ALIAS_POLL_ATTEMPTS`
+    - `HEDERA_ALIAS_POLL_DELAY_MS`
     - `MAGIC_JWT_ENABLED` (default false)
 
 ### Docker / VPS

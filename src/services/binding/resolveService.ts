@@ -2,6 +2,7 @@ import { config } from '../../config';
 import { log } from '../../util/log';
 import { ResolveResult, BindingEvent } from './types';
 import { ethers } from 'ethers';
+import { fetchMirrorJson } from '../hedera/client';
 
 // Simple in-memory cache with TTL
 const CACHE_TTL_MS = 60 * 1000; // 60 seconds
@@ -14,23 +15,15 @@ const resolveCache = new Map<string, CacheEntry>();
 export class ResolveService {
     private static async fetchMirrorMessages(topicId: string, limit: number, nextLink?: string): Promise<{ messages: any[], next?: string }> {
         try {
-            const url = nextLink ? `${config.MIRROR_NODE_URL}${nextLink}` : `${config.MIRROR_NODE_URL}/topics/${topicId}/messages?limit=${limit}&order=desc`;
+            const pathOrUrl = nextLink
+                ? nextLink
+                : `/topics/${topicId}/messages?limit=${limit}&order=desc`;
 
-            // Add a timeout to the fetch
-            const controller = new AbortController();
-            const timeout = setTimeout(() => controller.abort(), 2500); // 2.5s timeout
-
-            try {
-                const response = await fetch(url, { signal: controller.signal });
-                if (!response.ok) throw new Error(`Mirror node error: ${response.statusText}`);
-                const data = await response.json();
-                return {
-                    messages: data.messages || [],
-                    next: data.links?.next
-                };
-            } finally {
-                clearTimeout(timeout);
-            }
+            const data = await fetchMirrorJson<{ messages?: any[]; links?: { next?: string } }>(pathOrUrl);
+            return {
+                messages: data.messages || [],
+                next: data.links?.next
+            };
         } catch (error) {
             log.error('Failed to fetch from mirror node', error);
             // Return empty to fail soft

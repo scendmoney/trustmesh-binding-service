@@ -10,6 +10,8 @@ const envSchema = z.object({
     HEDERA_OPERATOR_ID: z.string().min(1),
     HEDERA_OPERATOR_KEY: z.string().min(1),
     MIRROR_NODE_URL: z.string().url().default('https://testnet.mirrornode.hedera.com/api/v1'),
+    MIRROR_NODE_AUTH_TYPE: z.enum(['none', 'bearer', 'x-api-key']).default('none'),
+    MIRROR_NODE_AUTH_TOKEN: z.string().optional(),
     IDENTITY_TOPIC_ID: z.string().min(1),
     MAGIC_PUBLIC_KEY: z.string().optional(),
     BINDING_SHARED_SECRET: z.string().optional(),
