@@ -1,6 +1,6 @@
 import { config } from '../../config';
 import { log } from '../../util/log';
-import { lookupAccountByEvm, provisionAccountForEvmAlias, submitToTopic } from '../hedera/client';
+import { fetchMirrorJson, lookupAccountByEvm, provisionAccountForEvmAlias, submitToTopic } from '../hedera/client';
 import type {
     FounderBindingEnvelope,
     FounderBindingFailureResponse,
@@ -141,35 +141,19 @@ const matchesFounder = (
 const fetchTopicPage = async (
     nextLink?: string
 ): Promise<{ messages: any[]; next?: string }> => {
-    const baseUrl = config.MIRROR_NODE_URL.endsWith('/')
-        ? config.MIRROR_NODE_URL
-        : `${config.MIRROR_NODE_URL}/`;
+    const pathOrUrl = nextLink
+        ? nextLink
+        : `/topics/${config.IDENTITY_TOPIC_ID}/messages?limit=100&order=desc`;
 
-    const url = nextLink
-        ? new URL(nextLink, baseUrl).toString()
-        : `${config.MIRROR_NODE_URL}/topics/${config.IDENTITY_TOPIC_ID}/messages?limit=100&order=desc`;
+    const payload = await fetchMirrorJson<{
+        messages?: any[];
+        links?: { next?: string };
+    }>(pathOrUrl);
 
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), config.MIRROR_NODE_TIMEOUT_MS);
-
-    try {
-        const response = await fetch(url, { signal: controller.signal });
-        if (!response.ok) {
-            throw new Error(`Mirror node returned ${response.status}`);
-        }
-
-        const payload = (await response.json()) as {
-            messages?: any[];
-            links?: { next?: string };
-        };
-
-        return {
-            messages: payload.messages ?? [],
-            next: payload.links?.next
-        };
-    } finally {
-        clearTimeout(timeout);
-    }
+    return {
+        messages: payload.messages ?? [],
+        next: payload.links?.next
+    };
 };
 
 const findTopicBinding = async (

@@ -18,6 +18,54 @@ const parseOperatorKey = (value: string): PrivateKey => {
     return PrivateKey.fromString(trimmed);
 };
 
+const buildMirrorHeaders = (): HeadersInit => {
+    if (!config.MIRROR_NODE_AUTH_TOKEN || config.MIRROR_NODE_AUTH_TYPE === 'none') {
+        return {};
+    }
+
+    if (config.MIRROR_NODE_AUTH_TYPE === 'bearer') {
+        return {
+            Authorization: `Bearer ${config.MIRROR_NODE_AUTH_TOKEN}`
+        };
+    }
+
+    return {
+        'x-api-key': config.MIRROR_NODE_AUTH_TOKEN
+    };
+};
+
+const toMirrorUrl = (pathOrUrl: string): string => {
+    if (/^https?:\/\//i.test(pathOrUrl)) {
+        return pathOrUrl;
+    }
+
+    const baseUrl = config.MIRROR_NODE_URL.endsWith('/')
+        ? config.MIRROR_NODE_URL
+        : `${config.MIRROR_NODE_URL}/`;
+
+    return new URL(pathOrUrl.replace(/^\//, ''), baseUrl).toString();
+};
+
+export const fetchMirrorJson = async <T>(pathOrUrl: string): Promise<T> => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), config.MIRROR_NODE_TIMEOUT_MS);
+
+    try {
+        const response = await fetch(toMirrorUrl(pathOrUrl), {
+            headers: buildMirrorHeaders(),
+            signal: controller.signal
+        });
+
+        if (!response.ok) {
+            throw new Error(`Mirror node returned ${response.status}`);
+        }
+
+        return await response.json() as T;
+    } finally {
+        clearTimeout(timeout);
+    }
+};
+
 export const getHederaClient = (): Client => {
     if (client) return client;
 
@@ -62,27 +110,18 @@ export const lookupAccountByEvm = async (evmAddress: string): Promise<string | n
     const normalized = evmAddress.trim().toLowerCase();
 
     try {
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), config.MIRROR_NODE_TIMEOUT_MS);
+        const directPayload = await fetchMirrorJson<{ account?: string }>(`/accounts/${encodeURIComponent(normalized)}`)
+            .catch(() => null);
 
-        try {
-            const response = await fetch(
-                `${config.MIRROR_NODE_URL}/accounts?account.id=${normalized}`,
-                { signal: controller.signal }
-            );
-
-            if (!response.ok) {
-                return null;
-            }
-
-            const payload = await response.json() as {
-                accounts?: Array<{ account?: string }>;
-            };
-
-            return payload.accounts?.[0]?.account ?? null;
-        } finally {
-            clearTimeout(timeout);
+        if (directPayload?.account) {
+            return directPayload.account;
         }
+
+        const queryPayload = await fetchMirrorJson<{
+            accounts?: Array<{ account?: string }>;
+        }>(`/accounts?account.id=${encodeURIComponent(normalized)}`).catch(() => null);
+
+        return queryPayload?.accounts?.[0]?.account ?? null;
     } catch (error) {
         log.warn('Mirror lookup failed', {
             evmAddress: normalized,
