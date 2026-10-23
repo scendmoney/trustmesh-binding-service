@@ -1,5 +1,5 @@
 import { config } from '../../config';
-import { fetchMirrorJson } from '../hedera/client';
+import { fetchMirrorTopicMessagesJson } from '../hedera/client';
 import { computeAddress, verifyMessage } from 'ethers';
 import type {
     BindingReference,
@@ -57,25 +57,19 @@ export class CurrentnessReadError extends Error {
     }
 }
 
-const normalize = (value: unknown): string =>
+const accountKey = (value: unknown): string =>
     typeof value === 'string' ? value.trim().toLowerCase() : '';
 
-const normalizeIdentity = (identity: CurrentnessIdentity): CurrentnessIdentity => ({
-    canonicalDid: normalize(identity.canonicalDid),
-    stableIdentifier: normalize(identity.stableIdentifier),
-    issuer: normalize(identity.issuer)
-});
-
 const sameIdentity = (a: CurrentnessIdentity, b: CurrentnessIdentity): boolean =>
-    normalize(a.canonicalDid) === normalize(b.canonicalDid) &&
-    normalize(a.stableIdentifier) === normalize(b.stableIdentifier) &&
-    normalize(a.issuer) === normalize(b.issuer);
+    a.canonicalDid === b.canonicalDid &&
+    a.stableIdentifier === b.stableIdentifier &&
+    a.issuer === b.issuer;
 
 const touchesIdentity = (candidate: Partial<CurrentnessIdentity> | undefined, identity: CurrentnessIdentity): boolean =>
     !!candidate && [
-        normalize(candidate.canonicalDid) === identity.canonicalDid,
-        normalize(candidate.stableIdentifier) === identity.stableIdentifier,
-        normalize(candidate.issuer) === identity.issuer
+        candidate.canonicalDid === identity.canonicalDid,
+        candidate.stableIdentifier === identity.stableIdentifier,
+        candidate.issuer === identity.issuer
     ].filter(Boolean).length > 0;
 
 const isIsoTimestamp = (value: unknown): value is string =>
@@ -133,7 +127,7 @@ const bindingRef = (
     topicId: config.IDENTITY_TOPIC_ID,
     bindingEventId: `${message.topic_id}:${message.sequence_number}`,
     schemaVersion: 1,
-    normalizationVersion: 'v1'
+    normalizationVersion: 'exact-v1'
 });
 
 const isBindingEnvelope = (value: unknown): value is FounderBindingEnvelope => {
@@ -158,7 +152,7 @@ const isBindingReference = (value: unknown): value is BindingReference => {
         typeof ref.topicId === 'string' &&
         typeof ref.bindingEventId === 'string' && ref.bindingEventId.startsWith(`${ref.topicId}:`) &&
         ref.schemaVersion === 1 &&
-        ref.normalizationVersion === 'v1' &&
+        ref.normalizationVersion === 'exact-v1' &&
         typeof ref.canonicalDid === 'string' &&
         typeof ref.stableIdentifier === 'string' &&
         typeof ref.issuer === 'string';
@@ -173,6 +167,12 @@ const isEvidenceProvenance = (value: unknown): value is EvidenceProvenanceV1 => 
         typeof provenance.authorizationBasis === 'string' && provenance.authorizationBasis.length > 0 &&
         provenance.authorizationBasisVersion === 'v1' &&
         provenance.signatureAlgorithm === 'EIP191_SECP256K1' &&
+        !!provenance.scope &&
+        typeof provenance.scope.purpose === 'string' &&
+        (provenance.scope.network === 'testnet' || provenance.scope.network === 'mainnet' || provenance.scope.network === 'previewnet') &&
+        typeof provenance.scope.topicId === 'string' &&
+        typeof provenance.scope.schemaVersion === 'number' &&
+        typeof provenance.scope.normalizationVersion === 'string' &&
         typeof provenance.signature === 'string' && provenance.signature.length > 0;
 };
 
@@ -185,7 +185,7 @@ const isLifecycleEvent = (value: unknown): value is IdentityLifecycleEventV1 => 
 
     return (event.type === 'IDENTITY_REVOKE' || event.type === 'IDENTITY_SUPERSEDE') &&
         event.schemaVersion === 1 &&
-        event.normalizationVersion === 'v1' &&
+        event.normalizationVersion === 'exact-v1' &&
         typeof event.lifecycleEventId === 'string' && event.lifecycleEventId.length > 0 &&
         isBindingReference(event.target) &&
         replacementIsValid &&
@@ -201,7 +201,7 @@ type AuthorityPolicy = {
     authorizationBasis: string | undefined;
 };
 
-type ProvenanceResult = 'valid' | 'unresolved' | 'unverified';
+type ProvenanceResult = 'valid' | 'unresolved' | 'unverified' | 'scope_mismatch';
 
 const verifyProvenance = (
     event: { provenance?: EvidenceProvenanceV1 },
@@ -213,8 +213,18 @@ const verifyProvenance = (
 
     const provenance = event.provenance;
     if (
-        normalize(message.payer_account_id) !== normalize(policy.accountId) ||
-        normalize(provenance.authorityAccountId) !== normalize(policy.accountId) ||
+        message.topic_id !== config.IDENTITY_TOPIC_ID ||
+        provenance.scope.network !== config.HEDERA_NETWORK ||
+        provenance.scope.topicId !== config.IDENTITY_TOPIC_ID ||
+        provenance.scope.purpose !== 'TRUSTMESH_IDENTITY_CURRENTNESS' ||
+        provenance.scope.schemaVersion !== 1 ||
+        provenance.scope.normalizationVersion !== 'exact-v1'
+    ) {
+        return 'scope_mismatch';
+    }
+    if (
+        accountKey(message.payer_account_id) !== accountKey(policy.accountId) ||
+        accountKey(provenance.authorityAccountId) !== accountKey(policy.accountId) ||
         provenance.authorityKeyId !== policy.keyId ||
         provenance.authorizationBasis !== policy.authorizationBasis ||
         provenance.authorizationBasisVersion !== 'v1'
@@ -228,7 +238,7 @@ const verifyProvenance = (
             canonicalEvidencePayload(event),
             provenance.signature
         );
-        return normalize(recoveredAddress) === normalize(expectedAddress) ? 'valid' : 'unverified';
+        return accountKey(recoveredAddress) === accountKey(expectedAddress) ? 'valid' : 'unverified';
     } catch {
         return 'unverified';
     }
@@ -298,7 +308,7 @@ export const reduceCurrentness = (
     watermark: number,
     coverageComplete: boolean
 ): CurrentnessResponse => {
-    const identity = normalizeIdentity(request.identity);
+    const identity = { ...request.identity };
     const watermarkMessage = messages.find(message => message.sequence_number === watermark);
     const watermarkTimestamp = watermarkMessage ? consensusIso(watermarkMessage.consensus_timestamp) : null;
 
@@ -311,6 +321,7 @@ export const reduceCurrentness = (
     let unsupportedApplicableEvidence = false;
     let unresolvedWriterAttribution = false;
     let unverifiedWriterProvenance = false;
+    let evidenceScopeMismatch = false;
     let conflictingLineage = false;
 
     const bindingAuthority: AuthorityPolicy = {
@@ -327,6 +338,10 @@ export const reduceCurrentness = (
     };
 
     for (const message of messages) {
+        if (message.topic_id !== config.IDENTITY_TOPIC_ID) {
+            evidenceScopeMismatch = true;
+            continue;
+        }
         const raw = decode(message.message);
         if (!raw || typeof raw !== 'object') continue;
 
@@ -344,11 +359,11 @@ export const reduceCurrentness = (
                 continue;
             }
 
-            const eventIdentity = normalizeIdentity({
+            const eventIdentity: CurrentnessIdentity = {
                 canonicalDid: raw.sub,
                 stableIdentifier: raw.payload.stable_identifier,
                 issuer: raw.payload.issuer
-            });
+            };
             if (sameIdentity(eventIdentity, identity) && raw.chain === config.HEDERA_NETWORK) {
                 const provenance = verifyProvenance(raw, message, bindingAuthority);
                 if (provenance === 'unresolved') {
@@ -357,6 +372,10 @@ export const reduceCurrentness = (
                 }
                 if (provenance === 'unverified') {
                     unverifiedWriterProvenance = true;
+                    continue;
+                }
+                if (provenance === 'scope_mismatch') {
+                    evidenceScopeMismatch = true;
                     continue;
                 }
                 bindings.push({
@@ -399,6 +418,10 @@ export const reduceCurrentness = (
             unverifiedWriterProvenance = true;
             continue;
         }
+        if (provenance === 'scope_mismatch') {
+            evidenceScopeMismatch = true;
+            continue;
+        }
 
         if (
             !sameIdentity(raw.target, identity) ||
@@ -426,6 +449,9 @@ export const reduceCurrentness = (
     }
     if (unverifiedWriterProvenance) {
         return makeResponse('UNKNOWN_STALE', 'UNVERIFIED_WRITER_PROVENANCE', identity, observedAt, watermark, watermarkTimestamp, true);
+    }
+    if (evidenceScopeMismatch) {
+        return makeResponse('UNKNOWN_STALE', 'EVIDENCE_SCOPE_MISMATCH', identity, observedAt, watermark, watermarkTimestamp, true);
     }
     if (conflictingLineage) {
         return makeResponse('AMBIGUOUS', 'CONFLICTING_LINEAGE', identity, observedAt, watermark, watermarkTimestamp, true);
@@ -551,6 +577,15 @@ export const reduceCurrentness = (
 
 const classifyReadFailure = (error: unknown): CurrentnessReadError => {
     if (error instanceof CurrentnessReadError) return error;
+    const policyCode = typeof error === 'object' && error !== null && 'code' in error
+        ? String((error as { code: unknown }).code)
+        : '';
+    if (policyCode === 'MIRROR_CONFIG_INVALID') {
+        return new CurrentnessReadError('CAPABILITY_ABSENT', 'Configured Mirror URL is invalid.');
+    }
+    if (policyCode.startsWith('MIRROR_')) {
+        return new CurrentnessReadError('UPSTREAM_PERMANENT_FAILURE', 'Mirror pagination violated the configured read boundary.');
+    }
     const status = typeof error === 'object' && error !== null && 'status' in error
         ? Number((error as { status: unknown }).status)
         : null;
@@ -566,15 +601,13 @@ const classifyReadFailure = (error: unknown): CurrentnessReadError => {
     if (status !== null) {
         return new CurrentnessReadError('UPSTREAM_PERMANENT_FAILURE', `Mirror rejected the read with ${status}.`);
     }
-    if (error instanceof Error && (error.name === 'AbortError' || /abort|timeout/i.test(error.message))) {
+    if (
+        (error instanceof Error && error.name === 'AbortError') ||
+        ['ETIMEDOUT', 'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_HEADERS_TIMEOUT'].includes(policyCode)
+    ) {
         return new CurrentnessReadError('TIMEOUT', 'Mirror read timed out.');
     }
-    if (error instanceof TypeError) {
-        return new CurrentnessReadError('TEMPORARY_OUTAGE', 'Mirror transport failed.');
-    }
-    const transportCode = typeof error === 'object' && error !== null && 'code' in error
-        ? String((error as { code: unknown }).code)
-        : '';
+    const transportCode = policyCode;
     if (['ECONNRESET', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN'].includes(transportCode)) {
         return new CurrentnessReadError('TEMPORARY_OUTAGE', 'Mirror transport failed.');
     }
@@ -616,8 +649,9 @@ export class CurrentnessService {
         const observedAt = new Date().toISOString();
 
         try {
-            const watermarkPage = await fetchMirrorJson<MirrorMessagePage>(
-                `/topics/${config.IDENTITY_TOPIC_ID}/messages?limit=1&order=desc`
+            const watermarkPage = await fetchMirrorTopicMessagesJson<MirrorMessagePage>(
+                `/topics/${config.IDENTITY_TOPIC_ID}/messages?limit=1&order=desc`,
+                config.IDENTITY_TOPIC_ID
             );
             const watermark = Number(watermarkPage.messages?.[0]?.sequence_number ?? 0);
             if (!Number.isSafeInteger(watermark) || watermark < 0) {
@@ -628,7 +662,10 @@ export class CurrentnessService {
             let next: string | undefined = `/topics/${config.IDENTITY_TOPIC_ID}/messages?limit=100&order=desc`;
             let pages = 0;
             while (next && pages < config.RESOLVE_MAX_PAGES) {
-                const page: MirrorMessagePage = await fetchMirrorJson<MirrorMessagePage>(next);
+                const page: MirrorMessagePage = await fetchMirrorTopicMessagesJson<MirrorMessagePage>(
+                    next,
+                    config.IDENTITY_TOPIC_ID
+                );
                 messages.push(...(page.messages ?? []).filter(
                     (message: MirrorMessage) => message.sequence_number <= watermark
                 ));

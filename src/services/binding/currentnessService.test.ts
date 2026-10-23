@@ -1,6 +1,6 @@
 import { createApp } from '../../app';
 import { canonicalEvidencePayload, CurrentnessReadError, CurrentnessService } from './currentnessService';
-import { fetchMirrorJson, provisionAccountForEvmAlias, submitToTopic } from '../hedera/client';
+import { fetchMirrorTopicMessagesJson, provisionAccountForEvmAlias, submitToTopic } from '../hedera/client';
 import type { IdentityLifecycleEventV1 } from './types';
 import { config } from '../../config';
 import { hashMessage, SigningKey } from 'ethers';
@@ -36,6 +36,7 @@ jest.mock('../../util/log', () => ({
 
 jest.mock('../hedera/client', () => ({
     fetchMirrorJson: jest.fn(),
+    fetchMirrorTopicMessagesJson: jest.fn(),
     lookupAccountByEvm: jest.fn(),
     provisionAccountForEvmAlias: jest.fn(),
     submitToTopic: jest.fn()
@@ -52,10 +53,11 @@ const request = { requestVersion: 'v1' as const, identity };
 const mirrorMessage = (
     sequence: number,
     event: unknown,
-    payerAccountId: string | null = '0.0.600'
+    payerAccountId: string | null = '0.0.600',
+    topicId = '0.0.999'
 ) => ({
     consensus_timestamp: `${1700000000 + sequence}.000000000`,
-    topic_id: '0.0.999',
+    topic_id: topicId,
     sequence_number: sequence,
     payer_account_id: payerAccountId ?? undefined,
     message: Buffer.from(JSON.stringify(event)).toString('base64')
@@ -104,6 +106,13 @@ const binding = (
         authorizationBasis: 'binding-producer-ruling-v1',
         authorizationBasisVersion: 'v1' as const,
         signatureAlgorithm: 'EIP191_SECP256K1' as const,
+        scope: {
+            purpose: 'TRUSTMESH_IDENTITY_CURRENTNESS' as const,
+            network: 'testnet' as const,
+            topicId: '0.0.999',
+            schemaVersion: 1 as const,
+            normalizationVersion: 'exact-v1' as const
+        },
         signature: ''
     }
 }, privateKey);
@@ -114,7 +123,7 @@ const reference = (sequence: number) => ({
     topicId: '0.0.999',
     bindingEventId: `0.0.999:${sequence}`,
     schemaVersion: 1 as const,
-    normalizationVersion: 'v1' as const
+    normalizationVersion: 'exact-v1' as const
 });
 
 const lifecycle = (
@@ -124,7 +133,7 @@ const lifecycle = (
 ): IdentityLifecycleEventV1 => signEvidence({
     type,
     schemaVersion: 1,
-    normalizationVersion: 'v1',
+    normalizationVersion: 'exact-v1',
     lifecycleEventId: options.id ?? `lifecycle-${targetSequence}`,
     target: reference(targetSequence),
     ...(type === 'IDENTITY_SUPERSEDE'
@@ -138,6 +147,13 @@ const lifecycle = (
         authorizationBasis: 'strategy-ruling-eugene-t1',
         authorizationBasisVersion: 'v1',
         signatureAlgorithm: 'EIP191_SECP256K1',
+        scope: {
+            purpose: 'TRUSTMESH_IDENTITY_CURRENTNESS',
+            network: 'testnet',
+            topicId: '0.0.999',
+            schemaVersion: 1,
+            normalizationVersion: 'exact-v1'
+        },
         signature: ''
     },
     evidenceRef: options.evidenceRef ?? `evidence:${targetSequence}`
@@ -145,7 +161,7 @@ const lifecycle = (
 
 const mockCompleteTopic = (messages: ReturnType<typeof mirrorMessage>[]) => {
     const newest = [...messages].sort((a, b) => b.sequence_number - a.sequence_number)[0];
-    (fetchMirrorJson as jest.Mock)
+    (fetchMirrorTopicMessagesJson as jest.Mock)
         .mockResolvedValueOnce({ messages: newest ? [newest] : [], links: {} })
         .mockResolvedValueOnce({
             messages: [...messages].sort((a, b) => b.sequence_number - a.sequence_number),
@@ -170,6 +186,74 @@ describe('CurrentnessService conformance', () => {
             coverageComplete: true
         });
         expect(result.validUntil).not.toBe(result.observedAt);
+    });
+
+    it('preserves exact case for DID, stable identifier, and issuer matching', async () => {
+        mockCompleteTopic([mirrorMessage(1, binding('0.0.101'))]);
+
+        const result = await CurrentnessService.read({
+            requestVersion: 'v1',
+            identity: {
+                canonicalDid: identity.canonicalDid.toUpperCase(),
+                stableIdentifier: identity.stableIdentifier.toUpperCase(),
+                issuer: 'https://ISSUER.example'
+            }
+        });
+
+        expect(result.disposition).toBe('UNBOUND');
+        expect(result.identity.canonicalDid).toBe(identity.canonicalDid.toUpperCase());
+        expect(result.identity.stableIdentifier).toBe(identity.stableIdentifier.toUpperCase());
+        expect(result.identity.issuer).toBe('https://ISSUER.example');
+    });
+
+    it.each(['canonicalDid', 'stableIdentifier', 'issuer'] as const)(
+        'does not case-fold the %s identity field',
+        async field => {
+            mockCompleteTopic([mirrorMessage(1, binding('0.0.101'))]);
+            const changedIdentity = { ...identity, [field]: identity[field].toUpperCase() };
+
+            const result = await CurrentnessService.read({
+                requestVersion: 'v1',
+                identity: changedIdentity
+            });
+
+            expect(result.disposition).not.toBe('CURRENT');
+            expect(result.identity[field]).toBe(changedIdentity[field]);
+        }
+    );
+
+    it.each(['network', 'topic', 'purpose', 'schema', 'normalization'] as const)(
+        'rejects signed binding evidence replayed across %s scope',
+        async replayDimension => {
+            const replay = binding('0.0.101');
+            if (replayDimension === 'network') {
+                (replay.provenance.scope as { network: string }).network = 'mainnet';
+            } else if (replayDimension === 'topic') {
+                replay.provenance.scope.topicId = '0.0.998';
+            } else if (replayDimension === 'purpose') {
+                (replay.provenance.scope as { purpose: string }).purpose = 'OTHER_PURPOSE';
+            } else if (replayDimension === 'schema') {
+                (replay.provenance.scope as { schemaVersion: number }).schemaVersion = 2;
+            } else {
+                (replay.provenance.scope as { normalizationVersion: string }).normalizationVersion = 'other-v1';
+            }
+            signEvidence(replay, BINDING_PRIVATE_KEY);
+            mockCompleteTopic([mirrorMessage(1, replay)]);
+
+            const result = await CurrentnessService.read(request);
+
+            expect(result.disposition).toBe('UNKNOWN_STALE');
+            expect(result.reason).toBe('EVIDENCE_SCOPE_MISMATCH');
+        }
+    );
+
+    it('rejects evidence whose observed Mirror topic differs from the configured topic', async () => {
+        mockCompleteTopic([mirrorMessage(1, binding('0.0.101'), '0.0.600', '0.0.998')]);
+
+        const result = await CurrentnessService.read(request);
+
+        expect(result.disposition).toBe('UNKNOWN_STALE');
+        expect(result.reason).toBe('EVIDENCE_SCOPE_MISMATCH');
     });
 
     it('keeps revocation effective despite a later ordinary assertion', async () => {
@@ -245,7 +329,7 @@ describe('CurrentnessService conformance', () => {
     });
 
     it('returns UNKNOWN_STALE when pagination does not cover the watermark', async () => {
-        (fetchMirrorJson as jest.Mock)
+        (fetchMirrorTopicMessagesJson as jest.Mock)
             .mockResolvedValueOnce({ messages: [mirrorMessage(3, binding('0.0.101'))] })
             .mockResolvedValueOnce({
                 messages: [mirrorMessage(3, binding('0.0.101'))],
@@ -412,14 +496,16 @@ describe('CurrentnessService conformance', () => {
 
     it.each([
         [Object.assign(new Error('request aborted'), { name: 'AbortError' }), 'TIMEOUT'],
-        [new TypeError('connection refused'), 'TEMPORARY_OUTAGE'],
+        [Object.assign(new Error('socket timeout'), { code: 'ETIMEDOUT' }), 'TIMEOUT'],
+        [new TypeError('malformed URL'), 'UPSTREAM_PERMANENT_FAILURE'],
+        [Object.assign(new Error('connection reset'), { code: 'ECONNRESET' }), 'TEMPORARY_OUTAGE'],
         [Object.assign(new Error('unauthorized'), { status: 401 }), 'UPSTREAM_AUTHENTICATION_FAILURE'],
         [Object.assign(new Error('forbidden'), { status: 403 }), 'UPSTREAM_AUTHENTICATION_FAILURE'],
         [Object.assign(new Error('missing'), { status: 404 }), 'UPSTREAM_CAPABILITY_ABSENT'],
         [Object.assign(new Error('bad request'), { status: 400 }), 'UPSTREAM_PERMANENT_FAILURE'],
         [Object.assign(new Error('unavailable'), { status: 503 }), 'TEMPORARY_OUTAGE']
     ])('classifies mirror failures without treating permanent errors as outages', async (failure, expectedCode) => {
-        (fetchMirrorJson as jest.Mock).mockRejectedValueOnce(failure);
+        (fetchMirrorTopicMessagesJson as jest.Mock).mockRejectedValueOnce(failure);
 
         await expect(CurrentnessService.read(request)).rejects.toMatchObject({
             code: expectedCode
@@ -460,7 +546,7 @@ describe('POST /v1/currentness authentication', () => {
 
             expect(response.status).toBe(401);
             expect(body.code).toBe('AUTHENTICATION_FAILURE');
-            expect(fetchMirrorJson).not.toHaveBeenCalled();
+            expect(fetchMirrorTopicMessagesJson).not.toHaveBeenCalled();
         } finally {
             await new Promise<void>((resolve, reject) => {
                 server.close(error => error ? reject(error) : resolve());

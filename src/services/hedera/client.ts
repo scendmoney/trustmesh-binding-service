@@ -34,16 +34,68 @@ const buildMirrorHeaders = (): HeadersInit => {
     };
 };
 
-const toMirrorUrl = (pathOrUrl: string): string => {
-    if (/^https?:\/\//i.test(pathOrUrl)) {
-        return pathOrUrl;
+export type MirrorNodeRequestPolicyCode =
+    | 'MIRROR_CONFIG_INVALID'
+    | 'MIRROR_URL_INVALID'
+    | 'MIRROR_ORIGIN_MISMATCH'
+    | 'MIRROR_PATH_MISMATCH'
+    | 'MIRROR_TOPIC_MISMATCH';
+
+export class MirrorNodeRequestPolicyError extends Error {
+    constructor(public readonly code: MirrorNodeRequestPolicyCode, message: string) {
+        super(message);
+        this.name = 'MirrorNodeRequestPolicyError';
+    }
+}
+
+const mirrorBase = (): URL => {
+    let base: URL;
+    try {
+        base = new URL(config.MIRROR_NODE_URL);
+    } catch {
+        throw new MirrorNodeRequestPolicyError('MIRROR_CONFIG_INVALID', 'Mirror base URL is invalid.');
+    }
+    if (
+        (base.protocol !== 'https:' && base.protocol !== 'http:') ||
+        base.username ||
+        base.password ||
+        base.search ||
+        base.hash
+    ) {
+        throw new MirrorNodeRequestPolicyError(
+            'MIRROR_CONFIG_INVALID',
+            'Mirror base URL must be an HTTP(S) API base without credentials, query, or fragment.'
+        );
+    }
+    base.pathname = base.pathname.replace(/\/+$/, '');
+    return base;
+};
+
+const toMirrorUrl = (pathOrUrl: string): URL => {
+    const base = mirrorBase();
+    const basePath = base.pathname === '/' ? '' : base.pathname;
+    let candidate: URL;
+    try {
+        if (/^https?:\/\//i.test(pathOrUrl) || pathOrUrl.startsWith('//')) {
+            candidate = new URL(pathOrUrl, base.origin);
+        } else if (basePath && pathOrUrl.startsWith(`${basePath}/`)) {
+            candidate = new URL(pathOrUrl, base.origin);
+        } else {
+            const relative = pathOrUrl.replace(/^\//, '');
+            candidate = new URL(`${basePath}/${relative}`, base.origin);
+        }
+    } catch {
+        throw new MirrorNodeRequestPolicyError('MIRROR_URL_INVALID', 'Mirror request URL is malformed.');
     }
 
-    const baseUrl = config.MIRROR_NODE_URL.endsWith('/')
-        ? config.MIRROR_NODE_URL
-        : `${config.MIRROR_NODE_URL}/`;
-
-    return new URL(pathOrUrl.replace(/^\//, ''), baseUrl).toString();
+    if (candidate.origin !== base.origin || candidate.username || candidate.password) {
+        throw new MirrorNodeRequestPolicyError('MIRROR_ORIGIN_MISMATCH', 'Mirror request origin does not match configured origin.');
+    }
+    if (basePath && candidate.pathname !== basePath && !candidate.pathname.startsWith(`${basePath}/`)) {
+        throw new MirrorNodeRequestPolicyError('MIRROR_PATH_MISMATCH', 'Mirror request path is outside the configured API base path.');
+    }
+    candidate.hash = '';
+    return candidate;
 };
 
 export class MirrorNodeHttpError extends Error {
@@ -53,14 +105,15 @@ export class MirrorNodeHttpError extends Error {
     }
 }
 
-export const fetchMirrorJson = async <T>(pathOrUrl: string): Promise<T> => {
+const fetchMirrorUrlJson = async <T>(url: URL): Promise<T> => {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), config.MIRROR_NODE_TIMEOUT_MS);
 
     try {
-        const response = await fetch(toMirrorUrl(pathOrUrl), {
+        const response = await fetch(url, {
             headers: buildMirrorHeaders(),
-            signal: controller.signal
+            signal: controller.signal,
+            redirect: 'error'
         });
 
         if (!response.ok) {
@@ -71,6 +124,35 @@ export const fetchMirrorJson = async <T>(pathOrUrl: string): Promise<T> => {
     } finally {
         clearTimeout(timeout);
     }
+};
+
+export const fetchMirrorJson = async <T>(pathOrUrl: string): Promise<T> =>
+    fetchMirrorUrlJson<T>(toMirrorUrl(pathOrUrl));
+
+export const fetchMirrorTopicMessagesJson = async <T>(
+    pathOrUrl: string,
+    expectedTopicId: string
+): Promise<T> => {
+    if (!/^\d+\.\d+\.\d+$/.test(expectedTopicId)) {
+        throw new MirrorNodeRequestPolicyError('MIRROR_CONFIG_INVALID', 'Configured Mirror topic ID is invalid.');
+    }
+    const base = mirrorBase();
+    const basePath = base.pathname === '/' ? '' : base.pathname;
+    const url = toMirrorUrl(pathOrUrl);
+    const expectedPath = `${basePath}/topics/${encodeURIComponent(expectedTopicId)}/messages`;
+    if (url.pathname !== expectedPath) {
+        const topicPrefix = `${basePath}/topics/`;
+        const expectedTopicPrefix = `${basePath}/topics/${encodeURIComponent(expectedTopicId)}/`;
+        throw new MirrorNodeRequestPolicyError(
+            url.pathname.startsWith(expectedTopicPrefix)
+                ? 'MIRROR_PATH_MISMATCH'
+                : url.pathname.startsWith(topicPrefix)
+                    ? 'MIRROR_TOPIC_MISMATCH'
+                    : 'MIRROR_PATH_MISMATCH',
+            'Mirror pagination URL does not match the configured topic messages path.'
+        );
+    }
+    return fetchMirrorUrlJson<T>(url);
 };
 
 export const getHederaClient = (): Client => {

@@ -113,6 +113,7 @@ export interface FounderBindingEnvelope {
     provenance?: EvidenceProvenanceV1;
 }
 
+// Contract: docs/IDENTITY_CURRENTNESS_V1.md
 export interface EvidenceProvenanceV1 {
     schemaVersion: 1;
     authorityAccountId: string;
@@ -120,7 +121,16 @@ export interface EvidenceProvenanceV1 {
     authorizationBasis: string;
     authorizationBasisVersion: 'v1';
     signatureAlgorithm: 'EIP191_SECP256K1';
+    scope: CurrentnessEvidenceScopeV1;
     signature: string;
+}
+
+export interface CurrentnessEvidenceScopeV1 {
+    purpose: 'TRUSTMESH_IDENTITY_CURRENTNESS';
+    network: 'testnet' | 'mainnet' | 'previewnet';
+    topicId: string;
+    schemaVersion: 1;
+    normalizationVersion: 'exact-v1';
 }
 
 export type CurrentnessDisposition =
@@ -147,13 +157,13 @@ export interface BindingReference extends CurrentnessIdentity {
     topicId: string;
     bindingEventId: string;
     schemaVersion: 1;
-    normalizationVersion: 'v1';
+    normalizationVersion: 'exact-v1';
 }
 
 export interface IdentityLifecycleEventV1 {
     type: 'IDENTITY_REVOKE' | 'IDENTITY_SUPERSEDE';
     schemaVersion: 1;
-    normalizationVersion: 'v1';
+    normalizationVersion: 'exact-v1';
     lifecycleEventId: string;
     target: BindingReference;
     replacement?: BindingReference;
@@ -172,7 +182,8 @@ export type CurrentnessReason =
     | 'INCOMPLETE_EVIDENCE'
     | 'UNSUPPORTED_EVIDENCE'
     | 'UNRESOLVED_WRITER_ATTRIBUTION'
-    | 'UNVERIFIED_WRITER_PROVENANCE';
+    | 'UNVERIFIED_WRITER_PROVENANCE'
+    | 'EVIDENCE_SCOPE_MISMATCH';
 
 export interface CurrentnessResponse {
     responseVersion: 'v1';

@@ -41,6 +41,9 @@ pnpm dev
 
 ## Currentness v1
 
+The versioned doctrine and producer contract are recorded in
+[`docs/IDENTITY_CURRENTNESS_V1.md`](docs/IDENTITY_CURRENTNESS_V1.md).
+
 `POST /v1/currentness` is a nonmutating, cache-free read. Authenticate with
 `x-trustmesh-currentness-token` and send:
 
@@ -65,12 +68,14 @@ conflict rather than selecting a candidate.
 Lifecycle records use `IdentityLifecycleEventV1` from
 `src/services/binding/types.ts`. They target an immutable binding reference and
 carry signed authority provenance, authorization-basis/version, evidence,
-schema, and normalization fields. `IDENTITY_SUPERSEDE` also names an exact
+schema, and exact normalization fields. `IDENTITY_SUPERSEDE` also names an exact
 replacement binding. Binding/assertion and lifecycle evidence use deterministic
 canonical JSON and `EIP191_SECP256K1` signatures. The reader accepts evidence
 only when its signature verifies against the separately configured public key
 and its key ID, payer, authority account, authorization basis, and basis version
 all match policy. Unsigned legacy evidence cannot produce `CURRENT`.
+Canonical DID, stable identifier, and issuer comparisons are exact under
+`exact-v1`; they are not case-folded or rewritten.
 Lifecycle effective time is the HCS consensus timestamp; payload timestamps do
 not schedule or backdate an effect.
 
