@@ -1,8 +1,8 @@
 # TrustMesh Identity Currentness v1
 
-Status: Strategy-ratified local implementation contract  
-Contract version: `v1`  
-Normalization version: `exact-v1`  
+Status: Strategy-ratified local implementation contract
+Contract version: `v1`
+Normalization version: `exact-v1`
 Production authority designation: **UNRESOLVED**
 
 This record makes the Strategy ruling supplied for the T1 currentness work
