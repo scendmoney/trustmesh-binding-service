@@ -7,6 +7,7 @@ import { log } from './util/log';
 import { ResolveService } from './services/binding/resolveService';
 import { BindingService } from './services/binding/bindingService';
 import { FounderBindingService } from './services/binding/founderBindingService';
+import { CurrentnessReadError, CurrentnessService } from './services/binding/currentnessService';
 import { z } from 'zod';
 
 export const createApp = () => {
@@ -61,6 +62,15 @@ export const createApp = () => {
             requestedRole: z.literal('foundingSteward')
         })
     });
+
+    const currentnessSchema = z.object({
+        requestVersion: z.literal('v1'),
+        identity: z.object({
+            canonicalDid: z.string().min(1),
+            stableIdentifier: z.string().min(1),
+            issuer: z.string().min(1)
+        }).strict()
+    }).strict();
 
     const requireWorldsBuilderToken = (req: express.Request): boolean => {
         if (!config.WORLDS_BUILDER_SERVICE_TOKEN) {
@@ -168,6 +178,63 @@ export const createApp = () => {
                 status: 'unbound',
                 reason: 'serviceUnavailable',
                 message: 'Founder binding route failed.'
+            });
+        }
+    });
+
+    app.post('/v1/currentness', generalLimiter, async (req, res) => {
+        if (!config.CURRENTNESS_SERVICE_TOKEN) {
+            res.status(503).json({
+                responseVersion: 'v1',
+                status: 'error',
+                code: 'CAPABILITY_ABSENT',
+                message: 'Currentness authentication is not configured.'
+            });
+            return;
+        }
+
+        if (req.header('x-trustmesh-currentness-token') !== config.CURRENTNESS_SERVICE_TOKEN) {
+            res.status(401).json({
+                responseVersion: 'v1',
+                status: 'error',
+                code: 'AUTHENTICATION_FAILURE',
+                message: 'Missing or invalid currentness service token.'
+            });
+            return;
+        }
+
+        try {
+            const body = currentnessSchema.parse(req.body);
+            const result = await CurrentnessService.read(body);
+            res.status(result.disposition === 'AMBIGUOUS' ? 409 : 200).json(result);
+        } catch (error) {
+            if (error instanceof z.ZodError) {
+                res.status(400).json({
+                    responseVersion: 'v1',
+                    status: 'error',
+                    code: 'INVALID_REQUEST',
+                    message: 'Invalid currentness request.',
+                    details: error.errors
+                });
+                return;
+            }
+
+            if (error instanceof CurrentnessReadError) {
+                res.status(error.code === 'TIMEOUT' ? 504 : 503).json({
+                    responseVersion: 'v1',
+                    status: 'error',
+                    code: error.code,
+                    message: error.message
+                });
+                return;
+            }
+
+            log.error('Currentness route error', error);
+            res.status(503).json({
+                responseVersion: 'v1',
+                status: 'error',
+                code: 'TRANSPORT_OUTAGE',
+                message: 'Currentness read failed.'
             });
         }
     });

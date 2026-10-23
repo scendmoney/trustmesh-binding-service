@@ -31,12 +31,49 @@ pnpm dev
 - `GET /v1/resolve`
 - `GET /v1/status`
 - `POST /v1/bind`
+- `POST /v1/currentness` (authenticated, read-only, complete-history lifecycle reduction)
 
 ## 🔒 Security
 - **Rate Limiting:** Global 60 req/min, Write 10 req/min.
 - **Fail Safe:** Returns `null` on resolution failure, does not crash.
 - **Oracle Pattern:** Only the server holds the Hedera Operator Key.
 - **Magic JWT:** Disabled by default. Set `MAGIC_JWT_ENABLED=true` only if proper verification is added.
+
+## Currentness v1
+
+`POST /v1/currentness` is a nonmutating, cache-free read. Authenticate with
+`x-trustmesh-currentness-token` and send:
+
+```json
+{
+  "requestVersion": "v1",
+  "identity": {
+    "canonicalDid": "did:example:subject",
+    "stableIdentifier": "issuer:subject",
+    "issuer": "https://issuer.example"
+  }
+}
+```
+
+The response disposition is one of `CURRENT`, `REVOKED`, `SUPERSEDED`,
+`UNBOUND`, `AMBIGUOUS`, or `UNKNOWN_STALE`. It identifies the exact identity,
+binding and lifecycle evidence, service version, observation validity window,
+and the network/topic/sequence watermark covered by the read.
+An `AMBIGUOUS` result is returned with HTTP `409` so consumers treat it as a
+conflict rather than selecting a candidate.
+
+Lifecycle records use `IdentityLifecycleEventV1` from
+`src/services/binding/types.ts`. They target an immutable binding reference and
+carry authority, authorization-basis, evidence, schema, and normalization
+fields. `IDENTITY_SUPERSEDE` also names an exact replacement binding. The reader
+accepts lifecycle records only when the Mirror-reported payer, configured
+authority, event authority, and configured authorization basis all agree.
+Lifecycle effective time is the HCS consensus timestamp; payload timestamps do
+not schedule or backdate an effect.
+
+No production lifecycle writer is configured or activated by this repository.
+Until an authority and basis are explicitly configured, the endpoint reports
+`CAPABILITY_ABSENT`.
 
 ## 🌍 Deployment
 
@@ -53,6 +90,10 @@ Designed to deploy to `binding.trustmesh.app`.
     - `MIRROR_NODE_AUTH_TOKEN` (required when auth type is not `none`)
     - `IDENTITY_TOPIC_ID`
     - `BINDING_SHARED_SECRET`
+    - `CURRENTNESS_SERVICE_TOKEN`
+    - `LIFECYCLE_AUTHORITY_ACCOUNT_ID`
+    - `LIFECYCLE_AUTHORIZATION_BASIS`
+    - `CURRENTNESS_VALIDITY_MS` (default 30000)
     - `RESOLVE_MAX_PAGES` (default 25)
     - `MIRROR_NODE_TIMEOUT_MS`
     - `HEDERA_ALIAS_POLL_ATTEMPTS`

@@ -111,3 +111,107 @@ export interface FounderBindingEnvelope {
         reason?: string | null;
     };
 }
+
+export type CurrentnessDisposition =
+    | 'CURRENT'
+    | 'REVOKED'
+    | 'SUPERSEDED'
+    | 'UNBOUND'
+    | 'AMBIGUOUS'
+    | 'UNKNOWN_STALE';
+
+export interface CurrentnessIdentity {
+    canonicalDid: string;
+    stableIdentifier: string;
+    issuer: string;
+}
+
+export interface CurrentnessRequest {
+    requestVersion: 'v1';
+    identity: CurrentnessIdentity;
+}
+
+export interface BindingReference extends CurrentnessIdentity {
+    network: 'testnet' | 'mainnet' | 'previewnet';
+    topicId: string;
+    bindingEventId: string;
+    schemaVersion: 1;
+    normalizationVersion: 'v1';
+}
+
+export interface IdentityLifecycleEventV1 {
+    type: 'IDENTITY_REVOKE' | 'IDENTITY_SUPERSEDE';
+    schemaVersion: 1;
+    normalizationVersion: 'v1';
+    lifecycleEventId: string;
+    target: BindingReference;
+    replacement?: BindingReference;
+    sourceEventAt: string;
+    authority: {
+        accountId: string;
+        authorizationBasis: string;
+    };
+    evidenceRef: string;
+}
+
+export type CurrentnessReason =
+    | 'ACTIVE_AT_WATERMARK'
+    | 'VALID_REVOCATION'
+    | 'VALID_SUPERSESSION'
+    | 'NO_BINDING'
+    | 'CONFLICTING_LINEAGE'
+    | 'INCOMPLETE_PAGINATION'
+    | 'INCOMPLETE_EVIDENCE'
+    | 'UNSUPPORTED_EVIDENCE'
+    | 'UNRESOLVED_WRITER_ATTRIBUTION';
+
+export interface CurrentnessResponse {
+    responseVersion: 'v1';
+    disposition: CurrentnessDisposition;
+    reason: CurrentnessReason;
+    identity: CurrentnessIdentity;
+    binding: {
+        hederaAccountId: string;
+        bindingEventId: string;
+        sourceEventAt: string;
+        effectiveAt: string;
+    } | null;
+    replacementBinding: {
+        hederaAccountId: string;
+        bindingEventId: string;
+    } | null;
+    lifecycle: {
+        type: IdentityLifecycleEventV1['type'];
+        lifecycleEventId: string;
+        sourceEventAt: string;
+        effectiveAt: string;
+        authorityAccountId: string;
+        authorizationBasis: string;
+        evidenceRef: string;
+    } | null;
+    evidenceRef: string;
+    serviceVersion: string;
+    observedAt: string;
+    validUntil: string;
+    authoritativeWatermark: {
+        network: 'testnet' | 'mainnet' | 'previewnet';
+        topicId: string;
+        sequenceNumber: number;
+        consensusTimestamp: string | null;
+        coverageComplete: boolean;
+    };
+}
+
+export type CurrentnessFailureCode =
+    | 'INVALID_REQUEST'
+    | 'AUTHENTICATION_FAILURE'
+    | 'CAPABILITY_ABSENT'
+    | 'TIMEOUT'
+    | 'TRANSPORT_OUTAGE';
+
+export interface CurrentnessFailureResponse {
+    responseVersion: 'v1';
+    status: 'error';
+    code: CurrentnessFailureCode;
+    message: string;
+}
