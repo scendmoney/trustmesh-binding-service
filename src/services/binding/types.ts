@@ -110,6 +110,17 @@ export interface FounderBindingEnvelope {
         create_tx_id?: string | null;
         reason?: string | null;
     };
+    provenance?: EvidenceProvenanceV1;
+}
+
+export interface EvidenceProvenanceV1 {
+    schemaVersion: 1;
+    authorityAccountId: string;
+    authorityKeyId: string;
+    authorizationBasis: string;
+    authorizationBasisVersion: 'v1';
+    signatureAlgorithm: 'EIP191_SECP256K1';
+    signature: string;
 }
 
 export type CurrentnessDisposition =
@@ -147,10 +158,7 @@ export interface IdentityLifecycleEventV1 {
     target: BindingReference;
     replacement?: BindingReference;
     sourceEventAt: string;
-    authority: {
-        accountId: string;
-        authorizationBasis: string;
-    };
+    provenance: EvidenceProvenanceV1;
     evidenceRef: string;
 }
 
@@ -163,7 +171,8 @@ export type CurrentnessReason =
     | 'INCOMPLETE_PAGINATION'
     | 'INCOMPLETE_EVIDENCE'
     | 'UNSUPPORTED_EVIDENCE'
-    | 'UNRESOLVED_WRITER_ATTRIBUTION';
+    | 'UNRESOLVED_WRITER_ATTRIBUTION'
+    | 'UNVERIFIED_WRITER_PROVENANCE';
 
 export interface CurrentnessResponse {
     responseVersion: 'v1';
@@ -175,6 +184,10 @@ export interface CurrentnessResponse {
         bindingEventId: string;
         sourceEventAt: string;
         effectiveAt: string;
+        authorityAccountId: string;
+        authorityKeyId: string;
+        authorizationBasis: string;
+        authorizationBasisVersion: 'v1';
     } | null;
     replacementBinding: {
         hederaAccountId: string;
@@ -186,7 +199,9 @@ export interface CurrentnessResponse {
         sourceEventAt: string;
         effectiveAt: string;
         authorityAccountId: string;
+        authorityKeyId: string;
         authorizationBasis: string;
+        authorizationBasisVersion: 'v1';
         evidenceRef: string;
     } | null;
     evidenceRef: string;
@@ -206,8 +221,12 @@ export type CurrentnessFailureCode =
     | 'INVALID_REQUEST'
     | 'AUTHENTICATION_FAILURE'
     | 'CAPABILITY_ABSENT'
+    | 'UPSTREAM_AUTHENTICATION_FAILURE'
+    | 'UPSTREAM_CAPABILITY_ABSENT'
+    | 'UPSTREAM_PERMANENT_FAILURE'
+    | 'INTERNAL_FAILURE'
     | 'TIMEOUT'
-    | 'TRANSPORT_OUTAGE';
+    | 'TEMPORARY_OUTAGE';
 
 export interface CurrentnessFailureResponse {
     responseVersion: 'v1';

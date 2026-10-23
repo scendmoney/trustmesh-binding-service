@@ -64,16 +64,20 @@ conflict rather than selecting a candidate.
 
 Lifecycle records use `IdentityLifecycleEventV1` from
 `src/services/binding/types.ts`. They target an immutable binding reference and
-carry authority, authorization-basis, evidence, schema, and normalization
-fields. `IDENTITY_SUPERSEDE` also names an exact replacement binding. The reader
-accepts lifecycle records only when the Mirror-reported payer, configured
-authority, event authority, and configured authorization basis all agree.
+carry signed authority provenance, authorization-basis/version, evidence,
+schema, and normalization fields. `IDENTITY_SUPERSEDE` also names an exact
+replacement binding. Binding/assertion and lifecycle evidence use deterministic
+canonical JSON and `EIP191_SECP256K1` signatures. The reader accepts evidence
+only when its signature verifies against the separately configured public key
+and its key ID, payer, authority account, authorization basis, and basis version
+all match policy. Unsigned legacy evidence cannot produce `CURRENT`.
 Lifecycle effective time is the HCS consensus timestamp; payload timestamps do
 not schedule or backdate an effect.
 
-No production lifecycle writer is configured or activated by this repository.
-Until an authority and basis are explicitly configured, the endpoint reports
-`CAPABILITY_ABSENT`.
+No production binding or lifecycle signing key or writer is configured or
+activated by this repository. Existing write paths remain unchanged and emit
+legacy unsigned records. Until both evidence authorities are explicitly
+configured, the endpoint reports `CAPABILITY_ABSENT`.
 
 ## 🌍 Deployment
 
@@ -91,7 +95,13 @@ Designed to deploy to `binding.trustmesh.app`.
     - `IDENTITY_TOPIC_ID`
     - `BINDING_SHARED_SECRET`
     - `CURRENTNESS_SERVICE_TOKEN`
+    - `BINDING_EVIDENCE_AUTHORITY_ACCOUNT_ID`
+    - `BINDING_EVIDENCE_AUTHORITY_KEY_ID`
+    - `BINDING_EVIDENCE_AUTHORITY_PUBLIC_KEY`
+    - `BINDING_EVIDENCE_AUTHORIZATION_BASIS`
     - `LIFECYCLE_AUTHORITY_ACCOUNT_ID`
+    - `LIFECYCLE_AUTHORITY_KEY_ID`
+    - `LIFECYCLE_AUTHORITY_PUBLIC_KEY`
     - `LIFECYCLE_AUTHORIZATION_BASIS`
     - `CURRENTNESS_VALIDITY_MS` (default 30000)
     - `RESOLVE_MAX_PAGES` (default 25)

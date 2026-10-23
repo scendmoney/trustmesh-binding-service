@@ -1,11 +1,13 @@
 import { config } from '../../config';
 import { fetchMirrorJson } from '../hedera/client';
+import { computeAddress, verifyMessage } from 'ethers';
 import type {
     BindingReference,
     CurrentnessIdentity,
     CurrentnessReason,
     CurrentnessRequest,
     CurrentnessResponse,
+    EvidenceProvenanceV1,
     FounderBindingEnvelope,
     IdentityLifecycleEventV1
 } from './types';
@@ -31,6 +33,7 @@ type BindingRecord = {
     sourceEventAt: string;
     effectiveAt: string;
     sequenceNumber: number;
+    provenance: EvidenceProvenanceV1;
 };
 
 type LifecycleRecord = {
@@ -41,7 +44,13 @@ type LifecycleRecord = {
 
 export class CurrentnessReadError extends Error {
     constructor(
-        public readonly code: 'CAPABILITY_ABSENT' | 'TIMEOUT' | 'TRANSPORT_OUTAGE',
+        public readonly code:
+            | 'CAPABILITY_ABSENT'
+            | 'UPSTREAM_AUTHENTICATION_FAILURE'
+            | 'UPSTREAM_CAPABILITY_ABSENT'
+            | 'UPSTREAM_PERMANENT_FAILURE'
+            | 'TIMEOUT'
+            | 'TEMPORARY_OUTAGE',
         message: string
     ) {
         super(message);
@@ -78,6 +87,35 @@ const decode = (message: string): unknown => {
     } catch {
         return null;
     }
+};
+
+const stableJson = (value: unknown): string => {
+    if (value === null || typeof value !== 'object') {
+        return JSON.stringify(value);
+    }
+    if (Array.isArray(value)) {
+        return `[${value.map(stableJson).join(',')}]`;
+    }
+
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record)
+        .filter(key => record[key] !== undefined)
+        .sort()
+        .map(key => `${JSON.stringify(key)}:${stableJson(record[key])}`)
+        .join(',')}}`;
+};
+
+export const canonicalEvidencePayload = (value: unknown): string => {
+    if (!value || typeof value !== 'object') {
+        throw new Error('Signed evidence must be an object.');
+    }
+    const event = value as Record<string, unknown>;
+    const provenance = event.provenance;
+    if (!provenance || typeof provenance !== 'object') {
+        throw new Error('Signed evidence provenance is missing.');
+    }
+    const { signature: _signature, ...unsignedProvenance } = provenance as Record<string, unknown>;
+    return stableJson({ ...event, provenance: unsignedProvenance });
 };
 
 const consensusIso = (timestamp: string): string => {
@@ -126,6 +164,18 @@ const isBindingReference = (value: unknown): value is BindingReference => {
         typeof ref.issuer === 'string';
 };
 
+const isEvidenceProvenance = (value: unknown): value is EvidenceProvenanceV1 => {
+    if (!value || typeof value !== 'object') return false;
+    const provenance = value as Partial<EvidenceProvenanceV1>;
+    return provenance.schemaVersion === 1 &&
+        typeof provenance.authorityAccountId === 'string' && provenance.authorityAccountId.length > 0 &&
+        typeof provenance.authorityKeyId === 'string' && provenance.authorityKeyId.length > 0 &&
+        typeof provenance.authorizationBasis === 'string' && provenance.authorizationBasis.length > 0 &&
+        provenance.authorizationBasisVersion === 'v1' &&
+        provenance.signatureAlgorithm === 'EIP191_SECP256K1' &&
+        typeof provenance.signature === 'string' && provenance.signature.length > 0;
+};
+
 const isLifecycleEvent = (value: unknown): value is IdentityLifecycleEventV1 => {
     if (!value || typeof value !== 'object') return false;
     const event = value as Partial<IdentityLifecycleEventV1>;
@@ -140,10 +190,48 @@ const isLifecycleEvent = (value: unknown): value is IdentityLifecycleEventV1 => 
         isBindingReference(event.target) &&
         replacementIsValid &&
         isIsoTimestamp(event.sourceEventAt) &&
-        !!event.authority &&
-        typeof event.authority.accountId === 'string' &&
-        typeof event.authority.authorizationBasis === 'string' &&
+        isEvidenceProvenance(event.provenance) &&
         typeof event.evidenceRef === 'string' && event.evidenceRef.length > 0;
+};
+
+type AuthorityPolicy = {
+    accountId: string | undefined;
+    keyId: string | undefined;
+    publicKey: string | undefined;
+    authorizationBasis: string | undefined;
+};
+
+type ProvenanceResult = 'valid' | 'unresolved' | 'unverified';
+
+const verifyProvenance = (
+    event: { provenance?: EvidenceProvenanceV1 },
+    message: MirrorMessage,
+    policy: AuthorityPolicy
+): ProvenanceResult => {
+    if (!message.payer_account_id) return 'unresolved';
+    if (!isEvidenceProvenance(event.provenance)) return 'unverified';
+
+    const provenance = event.provenance;
+    if (
+        normalize(message.payer_account_id) !== normalize(policy.accountId) ||
+        normalize(provenance.authorityAccountId) !== normalize(policy.accountId) ||
+        provenance.authorityKeyId !== policy.keyId ||
+        provenance.authorizationBasis !== policy.authorizationBasis ||
+        provenance.authorizationBasisVersion !== 'v1'
+    ) {
+        return 'unverified';
+    }
+
+    try {
+        const expectedAddress = computeAddress(policy.publicKey!);
+        const recoveredAddress = verifyMessage(
+            canonicalEvidencePayload(event),
+            provenance.signature
+        );
+        return normalize(recoveredAddress) === normalize(expectedAddress) ? 'valid' : 'unverified';
+    } catch {
+        return 'unverified';
+    }
 };
 
 const makeResponse = (
@@ -166,7 +254,11 @@ const makeResponse = (
         hederaAccountId: binding.accountId,
         bindingEventId: binding.ref.bindingEventId,
         sourceEventAt: binding.sourceEventAt,
-        effectiveAt: binding.effectiveAt
+        effectiveAt: binding.effectiveAt,
+        authorityAccountId: binding.provenance.authorityAccountId,
+        authorityKeyId: binding.provenance.authorityKeyId,
+        authorizationBasis: binding.provenance.authorizationBasis,
+        authorizationBasisVersion: binding.provenance.authorizationBasisVersion
     } : null,
     replacementBinding: replacement ? {
         hederaAccountId: replacement.accountId,
@@ -177,8 +269,10 @@ const makeResponse = (
         lifecycleEventId: lifecycle.event.lifecycleEventId,
         sourceEventAt: lifecycle.event.sourceEventAt,
         effectiveAt: lifecycle.effectiveAt,
-        authorityAccountId: lifecycle.event.authority.accountId,
-        authorizationBasis: lifecycle.event.authority.authorizationBasis,
+        authorityAccountId: lifecycle.event.provenance.authorityAccountId,
+        authorityKeyId: lifecycle.event.provenance.authorityKeyId,
+        authorizationBasis: lifecycle.event.provenance.authorizationBasis,
+        authorizationBasisVersion: lifecycle.event.provenance.authorizationBasisVersion,
         evidenceRef: lifecycle.event.evidenceRef
     } : null,
     evidenceRef: lifecycle?.event.evidenceRef ?? binding?.ref.bindingEventId ??
@@ -216,7 +310,21 @@ export const reduceCurrentness = (
     const lifecycle: LifecycleRecord[] = [];
     let unsupportedApplicableEvidence = false;
     let unresolvedWriterAttribution = false;
+    let unverifiedWriterProvenance = false;
     let conflictingLineage = false;
+
+    const bindingAuthority: AuthorityPolicy = {
+        accountId: config.BINDING_EVIDENCE_AUTHORITY_ACCOUNT_ID,
+        keyId: config.BINDING_EVIDENCE_AUTHORITY_KEY_ID,
+        publicKey: config.BINDING_EVIDENCE_AUTHORITY_PUBLIC_KEY,
+        authorizationBasis: config.BINDING_EVIDENCE_AUTHORIZATION_BASIS
+    };
+    const lifecycleAuthority: AuthorityPolicy = {
+        accountId: config.LIFECYCLE_AUTHORITY_ACCOUNT_ID,
+        keyId: config.LIFECYCLE_AUTHORITY_KEY_ID,
+        publicKey: config.LIFECYCLE_AUTHORITY_PUBLIC_KEY,
+        authorizationBasis: config.LIFECYCLE_AUTHORIZATION_BASIS
+    };
 
     for (const message of messages) {
         const raw = decode(message.message);
@@ -242,12 +350,22 @@ export const reduceCurrentness = (
                 issuer: raw.payload.issuer
             });
             if (sameIdentity(eventIdentity, identity) && raw.chain === config.HEDERA_NETWORK) {
+                const provenance = verifyProvenance(raw, message, bindingAuthority);
+                if (provenance === 'unresolved') {
+                    unresolvedWriterAttribution = true;
+                    continue;
+                }
+                if (provenance === 'unverified') {
+                    unverifiedWriterProvenance = true;
+                    continue;
+                }
                 bindings.push({
                     accountId: raw.payload.hedera_account_id,
                     ref: bindingRef(identity, message),
                     sourceEventAt: raw.iat,
                     effectiveAt: consensusIso(message.consensus_timestamp),
-                    sequenceNumber: message.sequence_number
+                    sequenceNumber: message.sequence_number,
+                    provenance: raw.provenance!
                 });
             } else if (touchesIdentity(eventIdentity, identity)) {
                 conflictingLineage = true;
@@ -260,25 +378,25 @@ export const reduceCurrentness = (
             target?: Partial<BindingReference>;
             authority?: { accountId?: string; authorizationBasis?: string };
         };
-        if (partial.type !== 'IDENTITY_REVOKE' && partial.type !== 'IDENTITY_SUPERSEDE') continue;
         if (!touchesIdentity(partial.target, identity)) continue;
+        if (partial.type !== 'IDENTITY_REVOKE' && partial.type !== 'IDENTITY_SUPERSEDE') {
+            if (typeof partial.type === 'string' && partial.type.startsWith('IDENTITY_')) {
+                unsupportedApplicableEvidence = true;
+            }
+            continue;
+        }
         if (!isLifecycleEvent(raw)) {
-            unsupportedApplicableEvidence = true;
+            unverifiedWriterProvenance = true;
             continue;
         }
 
-        const payer = normalize(message.payer_account_id);
-        const configuredAuthority = normalize(config.LIFECYCLE_AUTHORITY_ACCOUNT_ID);
-        const eventAuthority = normalize(raw.authority.accountId);
-        if (!payer) {
+        const provenance = verifyProvenance(raw, message, lifecycleAuthority);
+        if (provenance === 'unresolved') {
             unresolvedWriterAttribution = true;
             continue;
         }
-        if (
-            payer !== configuredAuthority ||
-            eventAuthority !== configuredAuthority ||
-            raw.authority.authorizationBasis !== config.LIFECYCLE_AUTHORIZATION_BASIS
-        ) {
+        if (provenance === 'unverified') {
+            unverifiedWriterProvenance = true;
             continue;
         }
 
@@ -305,6 +423,9 @@ export const reduceCurrentness = (
 
     if (unresolvedWriterAttribution) {
         return makeResponse('UNKNOWN_STALE', 'UNRESOLVED_WRITER_ATTRIBUTION', identity, observedAt, watermark, watermarkTimestamp, true);
+    }
+    if (unverifiedWriterProvenance) {
+        return makeResponse('UNKNOWN_STALE', 'UNVERIFIED_WRITER_PROVENANCE', identity, observedAt, watermark, watermarkTimestamp, true);
     }
     if (conflictingLineage) {
         return makeResponse('AMBIGUOUS', 'CONFLICTING_LINEAGE', identity, observedAt, watermark, watermarkTimestamp, true);
@@ -430,22 +551,62 @@ export const reduceCurrentness = (
 
 const classifyReadFailure = (error: unknown): CurrentnessReadError => {
     if (error instanceof CurrentnessReadError) return error;
+    const status = typeof error === 'object' && error !== null && 'status' in error
+        ? Number((error as { status: unknown }).status)
+        : null;
+    if (status === 401 || status === 403) {
+        return new CurrentnessReadError('UPSTREAM_AUTHENTICATION_FAILURE', `Mirror authentication failed with ${status}.`);
+    }
+    if (status === 404) {
+        return new CurrentnessReadError('UPSTREAM_CAPABILITY_ABSENT', 'Configured Mirror topic capability was not found.');
+    }
+    if (status !== null && [408, 425, 429, 500, 502, 503, 504].includes(status)) {
+        return new CurrentnessReadError('TEMPORARY_OUTAGE', `Mirror is temporarily unavailable (${status}).`);
+    }
+    if (status !== null) {
+        return new CurrentnessReadError('UPSTREAM_PERMANENT_FAILURE', `Mirror rejected the read with ${status}.`);
+    }
     if (error instanceof Error && (error.name === 'AbortError' || /abort|timeout/i.test(error.message))) {
         return new CurrentnessReadError('TIMEOUT', 'Mirror read timed out.');
     }
-    return new CurrentnessReadError('TRANSPORT_OUTAGE', 'Mirror read failed.');
+    if (error instanceof TypeError) {
+        return new CurrentnessReadError('TEMPORARY_OUTAGE', 'Mirror transport failed.');
+    }
+    const transportCode = typeof error === 'object' && error !== null && 'code' in error
+        ? String((error as { code: unknown }).code)
+        : '';
+    if (['ECONNRESET', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN'].includes(transportCode)) {
+        return new CurrentnessReadError('TEMPORARY_OUTAGE', 'Mirror transport failed.');
+    }
+    return new CurrentnessReadError('UPSTREAM_PERMANENT_FAILURE', 'Mirror returned an invalid permanent response.');
 };
 
 export class CurrentnessService {
     static assertCapability(): void {
         if (
             !config.CURRENTNESS_SERVICE_TOKEN ||
+            !config.BINDING_EVIDENCE_AUTHORITY_ACCOUNT_ID ||
+            !config.BINDING_EVIDENCE_AUTHORITY_KEY_ID ||
+            !config.BINDING_EVIDENCE_AUTHORITY_PUBLIC_KEY ||
+            !config.BINDING_EVIDENCE_AUTHORIZATION_BASIS ||
             !config.LIFECYCLE_AUTHORITY_ACCOUNT_ID ||
+            !config.LIFECYCLE_AUTHORITY_KEY_ID ||
+            !config.LIFECYCLE_AUTHORITY_PUBLIC_KEY ||
             !config.LIFECYCLE_AUTHORIZATION_BASIS
         ) {
             throw new CurrentnessReadError(
                 'CAPABILITY_ABSENT',
-                'Currentness authentication or lifecycle authority is not configured.'
+                'Currentness authentication or signed evidence authorities are not configured.'
+            );
+        }
+
+        try {
+            computeAddress(config.BINDING_EVIDENCE_AUTHORITY_PUBLIC_KEY);
+            computeAddress(config.LIFECYCLE_AUTHORITY_PUBLIC_KEY);
+        } catch {
+            throw new CurrentnessReadError(
+                'CAPABILITY_ABSENT',
+                'A configured evidence authority public key is invalid.'
             );
         }
     }
@@ -460,7 +621,7 @@ export class CurrentnessService {
             );
             const watermark = Number(watermarkPage.messages?.[0]?.sequence_number ?? 0);
             if (!Number.isSafeInteger(watermark) || watermark < 0) {
-                throw new CurrentnessReadError('TRANSPORT_OUTAGE', 'Mirror topic watermark is unavailable.');
+                throw new CurrentnessReadError('UPSTREAM_PERMANENT_FAILURE', 'Mirror topic watermark is invalid.');
             }
 
             const messages: MirrorMessage[] = [];

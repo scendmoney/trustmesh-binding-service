@@ -220,7 +220,12 @@ export const createApp = () => {
             }
 
             if (error instanceof CurrentnessReadError) {
-                res.status(error.code === 'TIMEOUT' ? 504 : 503).json({
+                const status = error.code === 'TIMEOUT'
+                    ? 504
+                    : error.code === 'UPSTREAM_AUTHENTICATION_FAILURE' || error.code === 'UPSTREAM_PERMANENT_FAILURE'
+                        ? 502
+                        : 503;
+                res.status(status).json({
                     responseVersion: 'v1',
                     status: 'error',
                     code: error.code,
@@ -230,10 +235,10 @@ export const createApp = () => {
             }
 
             log.error('Currentness route error', error);
-            res.status(503).json({
+            res.status(500).json({
                 responseVersion: 'v1',
                 status: 'error',
-                code: 'TRANSPORT_OUTAGE',
+                code: 'INTERNAL_FAILURE',
                 message: 'Currentness read failed.'
             });
         }

@@ -46,6 +46,13 @@ const toMirrorUrl = (pathOrUrl: string): string => {
     return new URL(pathOrUrl.replace(/^\//, ''), baseUrl).toString();
 };
 
+export class MirrorNodeHttpError extends Error {
+    constructor(public readonly status: number) {
+        super(`Mirror node returned ${status}`);
+        this.name = 'MirrorNodeHttpError';
+    }
+}
+
 export const fetchMirrorJson = async <T>(pathOrUrl: string): Promise<T> => {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), config.MIRROR_NODE_TIMEOUT_MS);
@@ -57,7 +64,7 @@ export const fetchMirrorJson = async <T>(pathOrUrl: string): Promise<T> => {
         });
 
         if (!response.ok) {
-            throw new Error(`Mirror node returned ${response.status}`);
+            throw new MirrorNodeHttpError(response.status);
         }
 
         return await response.json() as T;
