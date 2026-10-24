@@ -318,23 +318,17 @@ const blockedOnNonCurrent = (disposition: string): IdentityRegistrationBlockedRe
     blocked('CURRENTNESS_NOT_CURRENT', `Identity registration is blocked by currentness disposition ${disposition}.`);
 
 const reconcileAfterUncertainProvision = async (
-    input: IdentityRegistrationRequestV1,
-    signer: ReturnType<typeof getHederaOperatorEvidenceSigner>
+    input: IdentityRegistrationRequestV1
 ): Promise<IdentityRegistrationResponseV1> => {
     const fresh = await readCurrentness(input);
     if (!fresh.ok) return fresh.response;
     if (fresh.currentness.disposition === 'CURRENT') {
         return boundFromCurrentness(input, fresh.currentness);
     }
-    if (fresh.currentness.disposition !== 'UNBOUND') {
-        return blockedOnNonCurrent(fresh.currentness.disposition);
-    }
-
-    const alias = await reconcileEvmAlias(input.evmPublicAddress);
-    if (alias.status !== 'resolved') {
+    if (fresh.currentness.disposition === 'UNBOUND') {
         return pending('PROVIDER_OUTCOME_UNCERTAIN', 'Provider completion remains uncertain; retry only after another fresh reconciliation.');
     }
-    return publishBinding(input, alias.hederaAccountId, 'provider-existing', signer);
+    return blockedOnNonCurrent(fresh.currentness.disposition);
 };
 
 const reconcileAfterUncertainSubmission = async (
@@ -405,7 +399,7 @@ const performRegistration = async (
         const provisioned = await provisionAccountForEvmAlias(input.evmPublicAddress);
         return publishBinding(input, provisioned.hederaAccountId, 'provider-provisioned', authority.signer);
     } catch {
-        return reconcileAfterUncertainProvision(input, authority.signer);
+        return reconcileAfterUncertainProvision(input);
     }
 };
 

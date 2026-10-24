@@ -99,6 +99,35 @@ const expectNoSensitiveSentinels = (value: unknown): void => {
 
 const strictBlockedKeys = ['message', 'reason', 'responseVersion', 'retryable', 'status'];
 
+const expectExactBoundResponse = (
+    response: unknown,
+    expected: {
+        hederaAccountId: string;
+        sequenceNumber: string;
+        bindingEventId: string;
+        transactionId: string | null;
+        resolutionSource: 'currentness-reconciled' | 'provider-existing' | 'provider-provisioned';
+        boundAt?: string;
+    }
+): void => {
+    expect(response).toEqual({
+        responseVersion: 'v1',
+        status: 'bound',
+        identity,
+        evmPublicAddress: request.evmPublicAddress,
+        hederaAccountId: expected.hederaAccountId,
+        bindingEventReceipt: {
+            topicId: '0.0.999',
+            sequenceNumber: expected.sequenceNumber,
+            bindingEventId: expected.bindingEventId,
+            transactionId: expected.transactionId
+        },
+        resolutionSource: expected.resolutionSource,
+        serviceVersion: expect.any(String),
+        boundAt: expected.boundAt ?? expect.any(String)
+    });
+};
+
 const expectStrictBlockedEnvelope = (
     body: Record<string, unknown>,
     reason: IdentityRegistrationBlockedReasonV1
@@ -255,18 +284,12 @@ describe('IdentityRegistrationService', () => {
     it('creates a signed generic binding and the receipt reads as fresh CURRENT', async () => {
         const registered = await register();
 
-        expect(registered).toMatchObject({
-            responseVersion: 'v1',
-            status: 'bound',
-            identity,
-            evmPublicAddress: request.evmPublicAddress,
+        expectExactBoundResponse(registered, {
             hederaAccountId: '0.0.701',
-            resolutionSource: 'provider-provisioned',
-            bindingEventReceipt: {
-                topicId: '0.0.999',
-                sequenceNumber: '1',
-                bindingEventId: '0.0.999:1'
-            }
+            sequenceNumber: '1',
+            bindingEventId: '0.0.999:1',
+            transactionId: '0.0.600@1792864801.000000001',
+            resolutionSource: 'provider-provisioned'
         });
         expect(topicHistory).toHaveLength(1);
         const event = JSON.parse(Buffer.from(topicHistory[0].message, 'base64').toString('utf8')) as IdentityRegistrationBindingEnvelopeV1;
@@ -302,11 +325,13 @@ describe('IdentityRegistrationService', () => {
 
         const result = await register();
 
-        expect(result).toMatchObject({
-            status: 'bound',
-            resolutionSource: 'currentness-reconciled',
+        expectExactBoundResponse(result, {
             hederaAccountId: '0.0.701',
-            bindingEventReceipt: { bindingEventId: '0.0.999:1', transactionId: null }
+            sequenceNumber: '1',
+            bindingEventId: '0.0.999:1',
+            transactionId: null,
+            resolutionSource: 'currentness-reconciled',
+            boundAt: '2026-10-24T18:01:00.000Z'
         });
         expect(provisionAccountForEvmAlias).not.toHaveBeenCalled();
         expect(submitToTopic).not.toHaveBeenCalled();
@@ -318,7 +343,13 @@ describe('IdentityRegistrationService', () => {
         const result = await register();
         const event = JSON.parse(Buffer.from(topicHistory[0].message, 'base64').toString('utf8')) as IdentityRegistrationBindingEnvelopeV1;
 
-        expect(result).toMatchObject({ status: 'bound', resolutionSource: 'provider-existing' });
+        expectExactBoundResponse(result, {
+            hederaAccountId: '0.0.701',
+            sequenceNumber: '1',
+            bindingEventId: '0.0.999:1',
+            transactionId: '0.0.600@1792864801.000000001',
+            resolutionSource: 'provider-existing'
+        });
         expect(event.t).toBe('IDENTITY_ASSERT');
         expect(event.payload.resolution_source).toBe('provider-existing');
         expect(provisionAccountForEvmAlias).not.toHaveBeenCalled();
@@ -460,6 +491,50 @@ describe('IdentityRegistrationService', () => {
         expect(fetchMirrorTopicMessagesJson).toHaveBeenCalledTimes(6);
     });
 
+    it('returns an exact current binding after uncertain provisioning without another provider write', async () => {
+        (provisionAccountForEvmAlias as jest.Mock).mockImplementationOnce(async () => {
+            pushTopicEvent(signedEvidence());
+            throw new Error('provider timeout');
+        });
+
+        const result = await register();
+
+        expectExactBoundResponse(result, {
+            hederaAccountId: '0.0.701',
+            sequenceNumber: '1',
+            bindingEventId: '0.0.999:1',
+            transactionId: null,
+            resolutionSource: 'currentness-reconciled',
+            boundAt: '2026-10-24T18:01:00.000Z'
+        });
+        expect(provisionAccountForEvmAlias).toHaveBeenCalledTimes(1);
+        expect(reconcileEvmAlias).toHaveBeenCalledTimes(1);
+        expect(submitToTopic).not.toHaveBeenCalled();
+    });
+
+    it('does not publish after uncertain provisioning when UNBOUND currentness meets a resolved alias', async () => {
+        (provisionAccountForEvmAlias as jest.Mock).mockRejectedValueOnce(new Error('provider timeout'));
+        let aliasLookups = 0;
+        (reconcileEvmAlias as jest.Mock).mockImplementation(async () => {
+            aliasLookups += 1;
+            return aliasLookups === 1
+                ? { status: 'absent' }
+                : { status: 'resolved', hederaAccountId: '0.0.702' };
+        });
+
+        const result = await register();
+
+        expect(result).toMatchObject({
+            status: 'pending',
+            reason: 'PROVIDER_OUTCOME_UNCERTAIN',
+            retryable: true
+        });
+        expect(provisionAccountForEvmAlias).toHaveBeenCalledTimes(1);
+        expect(reconcileEvmAlias).toHaveBeenCalledTimes(1);
+        expect(submitToTopic).not.toHaveBeenCalled();
+        expect(topicHistory).toHaveLength(0);
+    });
+
     it('reconciles an uncertain HCS submit and returns its observed current receipt', async () => {
         (submitToTopic as jest.Mock).mockImplementationOnce(async (_topic: string, message: string) => {
             pushTopicEvent(JSON.parse(message));
@@ -468,10 +543,12 @@ describe('IdentityRegistrationService', () => {
 
         const result = await register();
 
-        expect(result).toMatchObject({
-            status: 'bound',
-            resolutionSource: 'currentness-reconciled',
-            bindingEventReceipt: { bindingEventId: '0.0.999:1', transactionId: null }
+        expectExactBoundResponse(result, {
+            hederaAccountId: '0.0.701',
+            sequenceNumber: '1',
+            bindingEventId: '0.0.999:1',
+            transactionId: null,
+            resolutionSource: 'currentness-reconciled'
         });
         expect(submitToTopic).toHaveBeenCalledTimes(1);
         expect(provisionAccountForEvmAlias).toHaveBeenCalledTimes(1);

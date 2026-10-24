@@ -127,6 +127,23 @@ The nonmutating API is `POST /v1/currentness`, authenticated with
 the resolve cache, submit events, provision accounts, mutate durable state, or
 activate an authority.
 
+The identity-registration producer's v1 `bound` response has exactly these
+top-level fields: `responseVersion`, `status`, `identity`, `evmPublicAddress`,
+`hederaAccountId`, `bindingEventReceipt`, `resolutionSource`, `serviceVersion`,
+and `boundAt`. `identity` has exactly `canonicalDid`, `stableIdentifier`, and
+`issuer`. The required receipt fields are `topicId`, `sequenceNumber`,
+`bindingEventId`, and `transactionId`. `sequenceNumber` is a positive canonical
+base-10 string within JavaScript's safe-integer range; it is never a JSON
+number. `bindingEventId` is the configured topic and that sequence joined by
+`:`. `transactionId` is a string for `provider-existing` and
+`provider-provisioned` submissions, and `null` for `currentness-reconciled`.
+
+After account provisioning has an uncertain outcome, only a fresh exact
+`CURRENT` read may return an existing bound result. `UNBOUND` returns pending;
+other non-current dispositions remain blocked. No binding submission or other
+provider write is authorized by that follow-up read, including when a separate
+alias lookup might resolve the account.
+
 The executable schema is in
 [`src/services/binding/types.ts`](../src/services/binding/types.ts), and the
 reducer/reader is in
