@@ -1,4 +1,4 @@
-import { config } from '../../config';
+import { config, RESOLVE_MAX_PAGES_HARD_MAX } from '../../config';
 import { fetchMirrorTopicMessagesJson } from '../hedera/client';
 import { computeAddress, verifyMessage } from 'ethers';
 import type {
@@ -12,7 +12,9 @@ import type {
     IdentityLifecycleEventV1
 } from './types';
 
-const SERVICE_VERSION = '2.1.0';
+const SERVICE_VERSION = '1.0.0';
+export const CURRENTNESS_MAX_TOTAL_RESPONSE_BYTES = 8 * 1024 * 1024;
+export const CURRENTNESS_MAX_TOTAL_MESSAGES = 5000;
 
 type MirrorMessage = {
     consensus_timestamp: string;
@@ -25,6 +27,71 @@ type MirrorMessage = {
 type MirrorMessagePage = {
     messages?: MirrorMessage[];
     links?: { next?: string };
+};
+
+const readPageMessages = (page: MirrorMessagePage): MirrorMessage[] => {
+    if (!page || typeof page !== 'object' || (page.messages !== undefined && !Array.isArray(page.messages))) {
+        throw new CurrentnessReadError('UPSTREAM_PERMANENT_FAILURE', 'Mirror returned an invalid currentness page.');
+    }
+    const messages = page.messages ?? [];
+    if (messages.some(message =>
+        !message ||
+        typeof message !== 'object' ||
+        !Number.isSafeInteger(message.sequence_number) ||
+        message.sequence_number < 1 ||
+        typeof message.consensus_timestamp !== 'string' ||
+        typeof message.topic_id !== 'string' ||
+        typeof message.message !== 'string' ||
+        (message.payer_account_id !== undefined && typeof message.payer_account_id !== 'string')
+    )) {
+        throw new CurrentnessReadError('UPSTREAM_PERMANENT_FAILURE', 'Mirror returned an invalid currentness page.');
+    }
+    const links = (page as MirrorMessagePage & { links?: unknown }).links;
+    if (
+        links !== undefined &&
+        (!links || typeof links !== 'object' || Array.isArray(links) ||
+            ((links as { next?: unknown }).next !== undefined && typeof (links as { next?: unknown }).next !== 'string'))
+    ) {
+        throw new CurrentnessReadError('UPSTREAM_PERMANENT_FAILURE', 'Mirror returned an invalid currentness page.');
+    }
+    return messages;
+};
+
+const uniqueSequenceStream = (
+    messages: MirrorMessage[],
+    watermark: number
+): { messages: MirrorMessage[]; valid: boolean } => {
+    const bySequence = new Map<number, MirrorMessage>();
+    let valid = true;
+
+    for (const message of messages) {
+        if (!Number.isSafeInteger(message.sequence_number)) {
+            valid = false;
+            continue;
+        }
+        if (message.sequence_number > watermark) continue;
+        if (message.sequence_number < 1) {
+            valid = false;
+            continue;
+        }
+
+        const existing = bySequence.get(message.sequence_number);
+        if (existing) {
+            if (stableJson(existing) !== stableJson(message)) {
+                throw new CurrentnessReadError(
+                    'UPSTREAM_PERMANENT_FAILURE',
+                    'Mirror returned conflicting content for a topic sequence.'
+                );
+            }
+            continue;
+        }
+        bySequence.set(message.sequence_number, message);
+    }
+
+    return {
+        messages: [...bySequence.values()].sort((a, b) => a.sequence_number - b.sequence_number),
+        valid
+    };
 };
 
 type BindingRecord = {
@@ -54,6 +121,7 @@ export class CurrentnessReadError extends Error {
         message: string
     ) {
         super(message);
+        this.name = 'CurrentnessReadError';
     }
 }
 
@@ -459,10 +527,6 @@ export const reduceCurrentness = (
     if (unsupportedApplicableEvidence) {
         return makeResponse('UNKNOWN_STALE', 'UNSUPPORTED_EVIDENCE', identity, observedAt, watermark, watermarkTimestamp, true);
     }
-    if (bindings.length === 0) {
-        return makeResponse('UNBOUND', 'NO_BINDING', identity, observedAt, watermark, watermarkTimestamp, true);
-    }
-
     const bindingByRef = new Map(bindings.map(binding => [binding.ref.bindingEventId, binding]));
     const lifecycleById = new Map<string, LifecycleRecord>();
     for (const record of lifecycle.sort((a, b) => a.sequenceNumber - b.sequenceNumber)) {
@@ -476,66 +540,58 @@ export const reduceCurrentness = (
         lifecycleById.set(record.event.lifecycleEventId, record);
     }
 
-    type AccountTransition = { record: LifecycleRecord; replacementAccountId?: string };
-    const transitions = new Map<string, AccountTransition>();
+    type BindingTransition = {
+        record: LifecycleRecord;
+        target: BindingRecord;
+        replacement: BindingRecord | null;
+    };
+    const transitions = new Map<string, BindingTransition>();
+    const replacementBindingIds = new Set<string>();
     for (const record of lifecycleById.values()) {
-        const target = bindingByRef.get(record.event.target.bindingEventId);
+        const targetId = record.event.target.bindingEventId;
+        const target = bindingByRef.get(targetId);
         if (!target || target.sequenceNumber >= record.sequenceNumber) {
             return makeResponse('UNKNOWN_STALE', 'INCOMPLETE_EVIDENCE', identity, observedAt, watermark, watermarkTimestamp, true);
         }
 
-        let replacementAccountId: string | undefined;
+        let replacement: BindingRecord | null = null;
         if (record.event.type === 'IDENTITY_SUPERSEDE') {
-            const replacement = bindingByRef.get(record.event.replacement!.bindingEventId);
+            replacement = bindingByRef.get(record.event.replacement!.bindingEventId) ?? null;
             if (!replacement || replacement.sequenceNumber >= record.sequenceNumber) {
                 return makeResponse('UNKNOWN_STALE', 'INCOMPLETE_EVIDENCE', identity, observedAt, watermark, watermarkTimestamp, true);
             }
-            replacementAccountId = replacement.accountId;
-            if (replacementAccountId === target.accountId) {
-                return makeResponse('AMBIGUOUS', 'CONFLICTING_LINEAGE', identity, observedAt, watermark, watermarkTimestamp, true);
-            }
         }
 
-        const existing = transitions.get(target.accountId);
+        const existing = transitions.get(targetId);
         if (existing) {
             return makeResponse('AMBIGUOUS', 'CONFLICTING_LINEAGE', identity, observedAt, watermark, watermarkTimestamp, true);
         }
-        transitions.set(target.accountId, { record, replacementAccountId });
+        transitions.set(targetId, { record, target, replacement });
+        if (replacement) replacementBindingIds.add(replacement.ref.bindingEventId);
     }
 
-    const bindingsByAccount = new Map<string, BindingRecord[]>();
-    for (const binding of bindings) {
-        const records = bindingsByAccount.get(binding.accountId) ?? [];
-        records.push(binding);
-        bindingsByAccount.set(binding.accountId, records);
+    if (bindings.length === 0) {
+        return makeResponse('UNBOUND', 'NO_BINDING', identity, observedAt, watermark, watermarkTimestamp, true);
     }
-    const representatives = new Map(
-        [...bindingsByAccount.entries()].map(([accountId, records]) => [
-            accountId,
-            records.sort((a, b) => b.sequenceNumber - a.sequenceNumber)[0]
-        ])
+
+    const roots = bindings.filter(binding => !replacementBindingIds.has(binding.ref.bindingEventId));
+
+    // An assertion after a valid revocation does not reactivate that exact binding.
+    // Keep the response anchored to the revocation's target, never a later assertion.
+    const revocations = [...transitions.values()].filter(
+        transition => transition.record.event.type === 'IDENTITY_REVOKE'
     );
-
-    const replacementAccounts = new Set(
-        [...transitions.values()].map(value => value.replacementAccountId).filter((value): value is string => !!value)
-    );
-    const roots = [...bindingsByAccount.keys()].filter(accountId => !replacementAccounts.has(accountId));
-    if (roots.length !== 1) {
-        return makeResponse('AMBIGUOUS', 'CONFLICTING_LINEAGE', identity, observedAt, watermark, watermarkTimestamp, true);
-    }
-
-    const root = representatives.get(roots[0])!;
-    let accountId = roots[0];
-    let supersession: LifecycleRecord | null = null;
-    const visited = new Set<string>();
-    while (true) {
-        if (visited.has(accountId)) {
-            return makeResponse('AMBIGUOUS', 'CONFLICTING_LINEAGE', identity, observedAt, watermark, watermarkTimestamp, true);
-        }
-        visited.add(accountId);
-        const transition = transitions.get(accountId);
-        if (!transition) break;
-        if (transition.record.event.type === 'IDENTITY_REVOKE') {
+    if (revocations.length === 1) {
+        const transition = revocations[0];
+        const laterAssertions = bindings.filter(
+            binding => binding.ref.bindingEventId !== transition.target.ref.bindingEventId
+        );
+        if (laterAssertions.length > 0 && laterAssertions.every(binding =>
+            binding.accountId === transition.target.accountId &&
+            binding.sequenceNumber > transition.record.sequenceNumber &&
+            !transitions.has(binding.ref.bindingEventId) &&
+            !replacementBindingIds.has(binding.ref.bindingEventId)
+        )) {
             return makeResponse(
                 'REVOKED',
                 'VALID_REVOCATION',
@@ -544,17 +600,57 @@ export const reduceCurrentness = (
                 watermark,
                 watermarkTimestamp,
                 true,
-                representatives.get(accountId)!,
+                transition.target,
+                null,
+                transition.record
+            );
+        }
+    }
+
+    if (roots.length !== 1) {
+        return makeResponse('AMBIGUOUS', 'CONFLICTING_LINEAGE', identity, observedAt, watermark, watermarkTimestamp, true);
+    }
+
+    const root = roots[0];
+    let active = root;
+    let supersession: LifecycleRecord | null = null;
+    const visited = new Set<string>();
+    while (true) {
+        const bindingEventId = active.ref.bindingEventId;
+        if (visited.has(bindingEventId)) {
+            return makeResponse('AMBIGUOUS', 'CONFLICTING_LINEAGE', identity, observedAt, watermark, watermarkTimestamp, true);
+        }
+        visited.add(bindingEventId);
+        const transition = transitions.get(bindingEventId);
+        if (!transition) break;
+        if (transition.record.event.type === 'IDENTITY_REVOKE') {
+            const unvisited = bindings.filter(binding => !visited.has(binding.ref.bindingEventId));
+            if (unvisited.length > 0 && !unvisited.every(binding =>
+                binding.accountId === transition.target.accountId &&
+                binding.sequenceNumber > transition.record.sequenceNumber &&
+                !transitions.has(binding.ref.bindingEventId) &&
+                !replacementBindingIds.has(binding.ref.bindingEventId)
+            )) {
+                return makeResponse('AMBIGUOUS', 'CONFLICTING_LINEAGE', identity, observedAt, watermark, watermarkTimestamp, true);
+            }
+            return makeResponse(
+                'REVOKED',
+                'VALID_REVOCATION',
+                identity,
+                observedAt,
+                watermark,
+                watermarkTimestamp,
+                true,
+                transition.target,
                 null,
                 transition.record
             );
         }
         supersession = transition.record;
-        accountId = transition.replacementAccountId!;
+        active = transition.replacement!;
     }
 
-    const active = representatives.get(accountId);
-    if (!active || visited.size !== bindingsByAccount.size) {
+    if (visited.size !== bindingByRef.size) {
         return makeResponse('AMBIGUOUS', 'CONFLICTING_LINEAGE', identity, observedAt, watermark, watermarkTimestamp, true);
     }
     if (supersession) {
@@ -617,6 +713,18 @@ const classifyReadFailure = (error: unknown): CurrentnessReadError => {
 export class CurrentnessService {
     static assertCapability(): void {
         if (
+            config.RESOLVE_MAX_PAGES_VALID === false ||
+            !Number.isSafeInteger(config.RESOLVE_MAX_PAGES) ||
+            config.RESOLVE_MAX_PAGES <= 0 ||
+            config.RESOLVE_MAX_PAGES > RESOLVE_MAX_PAGES_HARD_MAX
+        ) {
+            throw new CurrentnessReadError(
+                'CAPABILITY_ABSENT',
+                'Currentness pagination limits are not configured safely.'
+            );
+        }
+
+        if (
             !config.CURRENTNESS_SERVICE_TOKEN ||
             !config.BINDING_EVIDENCE_AUTHORITY_ACCOUNT_ID ||
             !config.BINDING_EVIDENCE_AUTHORITY_KEY_ID ||
@@ -649,11 +757,37 @@ export class CurrentnessService {
         const observedAt = new Date().toISOString();
 
         try {
+            let totalResponseBytes = 0;
+            const onResponseBytes = (bytes: number): void => {
+                if (!Number.isSafeInteger(bytes) || bytes < 0) {
+                    throw new CurrentnessReadError(
+                        'UPSTREAM_PERMANENT_FAILURE',
+                        'Mirror returned an invalid currentness response size.'
+                    );
+                }
+                totalResponseBytes += bytes;
+                if (totalResponseBytes > CURRENTNESS_MAX_TOTAL_RESPONSE_BYTES) {
+                    throw new CurrentnessReadError(
+                        'UPSTREAM_PERMANENT_FAILURE',
+                        'Mirror currentness read exceeded the configured evidence limit.'
+                    );
+                }
+            };
+            const fetchOptions = { onResponseBytes };
             const watermarkPage = await fetchMirrorTopicMessagesJson<MirrorMessagePage>(
                 `/topics/${config.IDENTITY_TOPIC_ID}/messages?limit=1&order=desc`,
-                config.IDENTITY_TOPIC_ID
+                config.IDENTITY_TOPIC_ID,
+                fetchOptions
             );
-            const watermark = Number(watermarkPage.messages?.[0]?.sequence_number ?? 0);
+            const watermarkMessages = readPageMessages(watermarkPage);
+            let totalMessages = watermarkMessages.length;
+            if (totalMessages > CURRENTNESS_MAX_TOTAL_MESSAGES) {
+                throw new CurrentnessReadError(
+                    'UPSTREAM_PERMANENT_FAILURE',
+                    'Mirror currentness read exceeded the configured evidence limit.'
+                );
+            }
+            const watermark = watermarkMessages[0]?.sequence_number ?? 0;
             if (!Number.isSafeInteger(watermark) || watermark < 0) {
                 throw new CurrentnessReadError('UPSTREAM_PERMANENT_FAILURE', 'Mirror topic watermark is invalid.');
             }
@@ -664,20 +798,28 @@ export class CurrentnessService {
             while (next && pages < config.RESOLVE_MAX_PAGES) {
                 const page: MirrorMessagePage = await fetchMirrorTopicMessagesJson<MirrorMessagePage>(
                     next,
-                    config.IDENTITY_TOPIC_ID
+                    config.IDENTITY_TOPIC_ID,
+                    fetchOptions
                 );
-                messages.push(...(page.messages ?? []).filter(
-                    (message: MirrorMessage) => message.sequence_number <= watermark
-                ));
+                const pageMessages = readPageMessages(page);
+                totalMessages += pageMessages.length;
+                if (totalMessages > CURRENTNESS_MAX_TOTAL_MESSAGES) {
+                    throw new CurrentnessReadError(
+                        'UPSTREAM_PERMANENT_FAILURE',
+                        'Mirror currentness read exceeded the configured evidence limit.'
+                    );
+                }
+                messages.push(...pageMessages.filter(message => message.sequence_number <= watermark));
                 next = page.links?.next;
                 pages++;
             }
 
-            const seen = new Set(messages.map(message => message.sequence_number));
-            const coverageComplete = !next && seen.size === watermark &&
+            const sequenceStream = uniqueSequenceStream(messages, watermark);
+            const seen = new Set(sequenceStream.messages.map(message => message.sequence_number));
+            const coverageComplete = sequenceStream.valid && !next && seen.size === watermark &&
                 [...seen].every(sequence => Number.isSafeInteger(sequence) && sequence >= 1 && sequence <= watermark);
 
-            return reduceCurrentness(request, messages, observedAt, watermark, coverageComplete);
+            return reduceCurrentness(request, sequenceStream.messages, observedAt, watermark, coverageComplete);
         } catch (error) {
             throw classifyReadFailure(error);
         }

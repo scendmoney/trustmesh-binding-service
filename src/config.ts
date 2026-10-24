@@ -3,6 +3,9 @@ import { z } from 'zod';
 
 dotenv.config();
 
+export const RESOLVE_MAX_PAGES_HARD_MAX = 50;
+const RESOLVE_MAX_PAGES_DEFAULT = 25;
+
 const envSchema = z.object({
     PORT: z.string().default('3002'),
     NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
@@ -26,7 +29,7 @@ const envSchema = z.object({
     LIFECYCLE_AUTHORITY_PUBLIC_KEY: z.string().optional(),
     LIFECYCLE_AUTHORIZATION_BASIS: z.string().optional(),
     CURRENTNESS_VALIDITY_MS: z.coerce.number().int().positive().default(30000),
-    RESOLVE_MAX_PAGES: z.coerce.number().default(25),
+    RESOLVE_MAX_PAGES: z.string().default(String(RESOLVE_MAX_PAGES_DEFAULT)).transform(Number),
     MAGIC_JWT_ENABLED: z.enum(['true', 'false']).default('false'),
     CORS_ORIGINS: z.string().default('*'),
     MIRROR_NODE_TIMEOUT_MS: z.coerce.number().default(4000),
@@ -36,7 +39,17 @@ const envSchema = z.object({
 
 const parseEnv = () => {
     try {
-        return envSchema.parse(process.env);
+        const parsed = envSchema.parse(process.env);
+        const resolveMaxPagesValid = Number.isSafeInteger(parsed.RESOLVE_MAX_PAGES) &&
+            parsed.RESOLVE_MAX_PAGES > 0 &&
+            parsed.RESOLVE_MAX_PAGES <= RESOLVE_MAX_PAGES_HARD_MAX;
+        return {
+            ...parsed,
+            RESOLVE_MAX_PAGES: resolveMaxPagesValid
+                ? parsed.RESOLVE_MAX_PAGES
+                : RESOLVE_MAX_PAGES_DEFAULT,
+            RESOLVE_MAX_PAGES_VALID: resolveMaxPagesValid
+        };
     } catch (error) {
         if (error instanceof z.ZodError) {
             console.error('❌ Invalid environment variables:', JSON.stringify(error.format(), null, 2));

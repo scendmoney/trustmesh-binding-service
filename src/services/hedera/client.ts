@@ -39,7 +39,15 @@ export type MirrorNodeRequestPolicyCode =
     | 'MIRROR_URL_INVALID'
     | 'MIRROR_ORIGIN_MISMATCH'
     | 'MIRROR_PATH_MISMATCH'
-    | 'MIRROR_TOPIC_MISMATCH';
+    | 'MIRROR_TOPIC_MISMATCH'
+    | 'MIRROR_RESPONSE_TOO_LARGE';
+
+export const MIRROR_MAX_RESPONSE_BYTES = 1024 * 1024;
+
+export interface MirrorTopicMessageFetchOptions {
+    maxResponseBytes?: number;
+    onResponseBytes?: (bytes: number) => void;
+}
 
 export class MirrorNodeRequestPolicyError extends Error {
     constructor(public readonly code: MirrorNodeRequestPolicyCode, message: string) {
@@ -55,8 +63,13 @@ const mirrorBase = (): URL => {
     } catch {
         throw new MirrorNodeRequestPolicyError('MIRROR_CONFIG_INVALID', 'Mirror base URL is invalid.');
     }
+    const credentialsConfigured = config.MIRROR_NODE_AUTH_TYPE !== 'none' ||
+        Boolean(config.MIRROR_NODE_AUTH_TOKEN);
+    const isLoopbackHost = ['localhost', '127.0.0.1', '::1', '[::1]']
+        .includes(base.hostname.toLowerCase());
+    const allowHttpFixture = config.NODE_ENV === 'test' && isLoopbackHost && !credentialsConfigured;
     if (
-        (base.protocol !== 'https:' && base.protocol !== 'http:') ||
+        (base.protocol !== 'https:' && !(base.protocol === 'http:' && allowHttpFixture)) ||
         base.username ||
         base.password ||
         base.search ||
@@ -64,7 +77,7 @@ const mirrorBase = (): URL => {
     ) {
         throw new MirrorNodeRequestPolicyError(
             'MIRROR_CONFIG_INVALID',
-            'Mirror base URL must be an HTTP(S) API base without credentials, query, or fragment.'
+            'Mirror base URL must use HTTPS, except for credential-free localhost test fixtures, and must not include credentials, query, or fragment.'
         );
     }
     base.pathname = base.pathname.replace(/\/+$/, '');
@@ -105,7 +118,68 @@ export class MirrorNodeHttpError extends Error {
     }
 }
 
-const fetchMirrorUrlJson = async <T>(url: URL): Promise<T> => {
+const readResponseBytes = async (response: Response, maxResponseBytes: number): Promise<Buffer> => {
+    const responseHeaders = (response as Response & { headers?: Headers }).headers;
+    const contentLength = responseHeaders?.get?.('content-length');
+    if (contentLength && /^\d+$/.test(contentLength) && Number(contentLength) > maxResponseBytes) {
+        throw new MirrorNodeRequestPolicyError(
+            'MIRROR_RESPONSE_TOO_LARGE',
+            'Mirror response exceeded the configured read limit.'
+        );
+    }
+
+    const reader = response.body?.getReader();
+    if (!reader) {
+        const responseLike = response as Response & { json?: () => Promise<unknown> };
+        const rawBody = typeof response.text === 'function'
+            ? await response.text()
+            : JSON.stringify(await responseLike.json?.());
+        const body = Buffer.from(rawBody ?? '', 'utf8');
+        if (body.byteLength > maxResponseBytes) {
+            throw new MirrorNodeRequestPolicyError(
+                'MIRROR_RESPONSE_TOO_LARGE',
+                'Mirror response exceeded the configured read limit.'
+            );
+        }
+        return body;
+    }
+
+    const chunks: Buffer[] = [];
+    let totalBytes = 0;
+    while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (!value) continue;
+        totalBytes += value.byteLength;
+        if (totalBytes > maxResponseBytes) {
+            try {
+                await reader.cancel();
+            } catch {
+                // Preserve the typed size-limit failure if cancellation also fails.
+            }
+            throw new MirrorNodeRequestPolicyError(
+                'MIRROR_RESPONSE_TOO_LARGE',
+                'Mirror response exceeded the configured read limit.'
+            );
+        }
+        chunks.push(Buffer.from(value));
+    }
+    return Buffer.concat(chunks, totalBytes);
+};
+
+const fetchMirrorUrlJson = async <T>(
+    url: URL,
+    options: MirrorTopicMessageFetchOptions = {}
+): Promise<T> => {
+    const maxResponseBytes = options.maxResponseBytes ?? MIRROR_MAX_RESPONSE_BYTES;
+    if (
+        !Number.isSafeInteger(maxResponseBytes) ||
+        maxResponseBytes <= 0 ||
+        maxResponseBytes > MIRROR_MAX_RESPONSE_BYTES
+    ) {
+        throw new MirrorNodeRequestPolicyError('MIRROR_CONFIG_INVALID', 'Mirror response limit is invalid.');
+    }
+
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), config.MIRROR_NODE_TIMEOUT_MS);
 
@@ -120,7 +194,9 @@ const fetchMirrorUrlJson = async <T>(url: URL): Promise<T> => {
             throw new MirrorNodeHttpError(response.status);
         }
 
-        return await response.json() as T;
+        const body = await readResponseBytes(response, maxResponseBytes);
+        options.onResponseBytes?.(body.byteLength);
+        return JSON.parse(body.toString('utf8')) as T;
     } finally {
         clearTimeout(timeout);
     }
@@ -131,7 +207,8 @@ export const fetchMirrorJson = async <T>(pathOrUrl: string): Promise<T> =>
 
 export const fetchMirrorTopicMessagesJson = async <T>(
     pathOrUrl: string,
-    expectedTopicId: string
+    expectedTopicId: string,
+    options: MirrorTopicMessageFetchOptions = {}
 ): Promise<T> => {
     if (!/^\d+\.\d+\.\d+$/.test(expectedTopicId)) {
         throw new MirrorNodeRequestPolicyError('MIRROR_CONFIG_INVALID', 'Configured Mirror topic ID is invalid.');
@@ -152,7 +229,7 @@ export const fetchMirrorTopicMessagesJson = async <T>(
             'Mirror pagination URL does not match the configured topic messages path.'
         );
     }
-    return fetchMirrorUrlJson<T>(url);
+    return fetchMirrorUrlJson<T>(url, options);
 };
 
 export const getHederaClient = (): Client => {

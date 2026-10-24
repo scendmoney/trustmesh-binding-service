@@ -66,9 +66,13 @@ timestamps cannot backdate or schedule an effect.
 ## Reduction law
 
 - A valid revocation disqualifies its target. A later ordinary assertion cannot
-  reactivate it.
+  reactivate it. A revocation response identifies the exact targeted
+  `bindingEventId`; a later assertion is never substituted as the target.
 - Supersession atomically retires the exact prior binding in favor of the exact,
   independently valid replacement.
+- Reduction preserves binding-event references through the transition graph.
+  Multiple unlinked binding events remain ambiguous; an applicable transition
+  must resolve its exact target and replacement before it can affect currentness.
 - A missing replacement or missing prior target is incomplete evidence.
 - Competing, contradictory, cyclic, or disconnected transitions are conflict.
 - Exact replay of the same lifecycle event ID and payload is idempotent.
@@ -79,19 +83,36 @@ timestamps cannot backdate or schedule an effect.
   unverifiable provenance, and signed scope mismatch fail closed and cannot
   yield `CURRENT`.
 
-The dispositions are `CURRENT`, `REVOKED`, `SUPERSEDED`, `UNBOUND`,
+The producer dispositions are `CURRENT`, `REVOKED`, `SUPERSEDED`, `UNBOUND`,
 `AMBIGUOUS`, and `UNKNOWN_STALE`. `AMBIGUOUS` maps to HTTP conflict (`409`).
+Consumer policy may normalize them downstream (for example, into
+`CURRENT`/`DISQUALIFYING_EVIDENCE`/`STALE`); that mapping is not emitted by this
+producer. WorldsBuilder maps producer `CAPABILITY_ABSENT` to its
+`CAPABILITY_NOT_IMPLEMENTED` consumer code; this producer keeps the original
+failure code. `serviceVersion` reports the release version in `package.json`.
 
 ## Coverage and Mirror boundary
 
 `CURRENT` requires complete topic history through a declared authoritative
 watermark. Exhausted pagination limits, sequence gaps, or incomplete applicable
 lifecycle coverage produce `UNKNOWN_STALE`.
+Exact repeated messages for one topic sequence are deduplicated before coverage
+and reduction. Reuse of a sequence with different content fails closed as a
+typed upstream failure.
+
+`RESOLVE_MAX_PAGES` must be an integer from 1 through 50 (default 25).
+Individual Mirror responses are limited to 1 MiB; a complete currentness read,
+including its watermark response, is limited to 8 MiB and 5,000 messages.
+Exceeding a limit returns `UPSTREAM_PERMANENT_FAILURE` without logging identity
+or credential values.
 
 Every initial and continuation request is constrained before transport to the
 configured Mirror origin, configured API base path, exact configured topic, and
 the topic `messages` endpoint. Credentials are never attached to a cross-origin,
 cross-topic, or different-path continuation URL.
+HTTPS is required in production and whenever Mirror authentication is
+configured. HTTP is permitted only for credential-free localhost fixtures in
+`NODE_ENV=test`. Redirects are rejected.
 
 Mirror failures preserve policy-relevant classes: authentication failures,
 missing capability/configuration, permanent response failures, explicit

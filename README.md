@@ -64,6 +64,9 @@ binding and lifecycle evidence, service version, observation validity window,
 and the network/topic/sequence watermark covered by the read.
 An `AMBIGUOUS` result is returned with HTTP `409` so consumers treat it as a
 conflict rather than selecting a candidate.
+The producer keeps these dispositions distinct; downstream consumers may map
+them into their own policy categories. `serviceVersion` is the release version
+from `package.json`, and `CAPABILITY_ABSENT` remains the producer failure code.
 
 Lifecycle records use `IdentityLifecycleEventV1` from
 `src/services/binding/types.ts`. They target an immutable binding reference and
@@ -109,11 +112,18 @@ Designed to deploy to `binding.trustmesh.app`.
     - `LIFECYCLE_AUTHORITY_PUBLIC_KEY`
     - `LIFECYCLE_AUTHORIZATION_BASIS`
     - `CURRENTNESS_VALIDITY_MS` (default 30000)
-    - `RESOLVE_MAX_PAGES` (default 25)
+    - `RESOLVE_MAX_PAGES` (default 25; integer from 1 through 50)
     - `MIRROR_NODE_TIMEOUT_MS`
     - `HEDERA_ALIAS_POLL_ATTEMPTS`
     - `HEDERA_ALIAS_POLL_DELAY_MS`
     - `MAGIC_JWT_ENABLED` (default false)
+
+Currentness bounds each Mirror response to 1 MiB and each complete read to 8 MiB
+and 5,000 messages, including the watermark response. Exceeding a bound returns
+a typed `UPSTREAM_PERMANENT_FAILURE`; it does not log identity or credential
+values. HTTPS is required in production and whenever Mirror authentication is
+configured. HTTP is allowed only for credential-free localhost fixtures in
+`NODE_ENV=test`; redirects are rejected.
 
 ### Docker / VPS
 - Set `NODE_ENV=production`.

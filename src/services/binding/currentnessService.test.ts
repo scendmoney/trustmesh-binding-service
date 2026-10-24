@@ -1,5 +1,11 @@
 import { createApp } from '../../app';
-import { canonicalEvidencePayload, CurrentnessReadError, CurrentnessService } from './currentnessService';
+import {
+    canonicalEvidencePayload,
+    CURRENTNESS_MAX_TOTAL_MESSAGES,
+    CURRENTNESS_MAX_TOTAL_RESPONSE_BYTES,
+    CurrentnessReadError,
+    CurrentnessService
+} from './currentnessService';
 import { fetchMirrorTopicMessagesJson, provisionAccountForEvmAlias, submitToTopic } from '../hedera/client';
 import type { IdentityLifecycleEventV1 } from './types';
 import { config } from '../../config';
@@ -10,10 +16,12 @@ const LIFECYCLE_PRIVATE_KEY = `0x${'22'.repeat(32)}`;
 const WRONG_PRIVATE_KEY = `0x${'33'.repeat(32)}`;
 
 jest.mock('../../config', () => ({
+    RESOLVE_MAX_PAGES_HARD_MAX: 50,
     config: {
         HEDERA_NETWORK: 'testnet',
         IDENTITY_TOPIC_ID: '0.0.999',
         RESOLVE_MAX_PAGES: 2,
+        RESOLVE_MAX_PAGES_VALID: true,
         CURRENTNESS_VALIDITY_MS: 30000,
         CURRENTNESS_SERVICE_TOKEN: 'reader-secret',
         BINDING_EVIDENCE_AUTHORITY_ACCOUNT_ID: '0.0.600',
@@ -49,6 +57,7 @@ const identity = {
 };
 
 const request = { requestVersion: 'v1' as const, identity };
+const packageVersion = require('../../../package.json').version as string;
 
 const mirrorMessage = (
     sequence: number,
@@ -181,6 +190,7 @@ describe('CurrentnessService conformance', () => {
 
         expect(result.disposition).toBe('CURRENT');
         expect(result.binding?.hederaAccountId).toBe('0.0.101');
+        expect(result.serviceVersion).toBe(packageVersion);
         expect(result.authoritativeWatermark).toMatchObject({
             sequenceNumber: 1,
             coverageComplete: true
@@ -268,6 +278,7 @@ describe('CurrentnessService conformance', () => {
         expect(result.disposition).toBe('REVOKED');
         expect(result.reason).toBe('VALID_REVOCATION');
         expect(result.lifecycle?.evidenceRef).toBe('evidence:1');
+        expect(result.binding?.bindingEventId).toBe('0.0.999:1');
         expect(result.lifecycle?.sourceEventAt).toBe('2026-10-23T00:01:00.000Z');
         expect(result.lifecycle?.effectiveAt).toBe('2023-11-14T22:13:22.000Z');
     });
@@ -313,6 +324,35 @@ describe('CurrentnessService conformance', () => {
         expect(result.reason).toBe('CONFLICTING_LINEAGE');
     });
 
+    it('returns AMBIGUOUS for repeated same-account bindings without an exact transition edge', async () => {
+        mockCompleteTopic([
+            mirrorMessage(1, binding('0.0.101')),
+            mirrorMessage(2, binding('0.0.101', '2026-10-23T00:00:30.000Z', 'IDENTITY_ASSERT'))
+        ]);
+
+        const result = await CurrentnessService.read(request);
+
+        expect(result.disposition).toBe('AMBIGUOUS');
+        expect(result.reason).toBe('CONFLICTING_LINEAGE');
+    });
+
+    it('resolves same-account supersession through exact binding event references', async () => {
+        mockCompleteTopic([
+            mirrorMessage(1, binding('0.0.101')),
+            mirrorMessage(2, binding('0.0.101', '2026-10-23T00:00:30.000Z', 'IDENTITY_ASSERT')),
+            mirrorMessage(3, lifecycle('IDENTITY_SUPERSEDE', 1, { replacementSequence: 2 }), '0.0.700')
+        ]);
+
+        const result = await CurrentnessService.read(request);
+
+        expect(result.disposition).toBe('SUPERSEDED');
+        expect(result.binding?.bindingEventId).toBe('0.0.999:1');
+        expect(result.replacementBinding).toEqual({
+            hederaAccountId: '0.0.101',
+            bindingEventId: '0.0.999:2'
+        });
+    });
+
     it('returns AMBIGUOUS for a supported binding with conflicting issuer lineage', async () => {
         const conflicting = binding(
             '0.0.101',
@@ -345,6 +385,28 @@ describe('CurrentnessService conformance', () => {
         expect(result.disposition).toBe('UNKNOWN_STALE');
         expect(result.reason).toBe('INCOMPLETE_PAGINATION');
         expect(result.authoritativeWatermark.coverageComplete).toBe(false);
+    });
+
+    it('deduplicates exact repeated topic sequence messages before coverage and reduction', async () => {
+        const repeated = mirrorMessage(1, binding('0.0.101'));
+        mockCompleteTopic([repeated, { ...repeated }]);
+
+        const result = await CurrentnessService.read(request);
+
+        expect(result.disposition).toBe('CURRENT');
+        expect(result.authoritativeWatermark.coverageComplete).toBe(true);
+    });
+
+    it('fails closed when one topic sequence has different message content', async () => {
+        mockCompleteTopic([
+            mirrorMessage(1, binding('0.0.101')),
+            mirrorMessage(1, binding('0.0.202'))
+        ]);
+
+        await expect(CurrentnessService.read(request)).rejects.toMatchObject({
+            name: 'CurrentnessReadError',
+            code: 'UPSTREAM_PERMANENT_FAILURE'
+        });
     });
 
     it('treats an exact lifecycle replay as idempotent', async () => {
@@ -392,11 +454,26 @@ describe('CurrentnessService conformance', () => {
         expect(result.reason).toBe('INCOMPLETE_EVIDENCE');
     });
 
+    it.each(['IDENTITY_REVOKE', 'IDENTITY_SUPERSEDE'] as const)(
+        'returns incomplete evidence for an orphan %s before considering UNBOUND',
+        async type => {
+            mockCompleteTopic([
+                mirrorMessage(1, lifecycle(type, 99, { replacementSequence: 100 }), '0.0.700')
+            ]);
+
+            const result = await CurrentnessService.read(request);
+
+            expect(result.disposition).toBe('UNKNOWN_STALE');
+            expect(result.reason).toBe('INCOMPLETE_EVIDENCE');
+        }
+    );
+
     it('does not invoke submit or provisioning paths', async () => {
         mockCompleteTopic([mirrorMessage(1, binding('0.0.101'))]);
 
         await CurrentnessService.read(request);
 
+        expect(fetchMirrorTopicMessagesJson).toHaveBeenCalled();
         expect(submitToTopic).not.toHaveBeenCalled();
         expect(provisionAccountForEvmAlias).not.toHaveBeenCalled();
     });
@@ -523,6 +600,53 @@ describe('CurrentnessService conformance', () => {
             config.LIFECYCLE_AUTHORITY_ACCOUNT_ID = previous;
         }
     });
+
+    it.each([NaN, Infinity, 0, 1.5, 51])(
+        'reports CAPABILITY_ABSENT for unsafe RESOLVE_MAX_PAGES value %s',
+        pages => {
+            const previousPages = config.RESOLVE_MAX_PAGES;
+            const previousValid = config.RESOLVE_MAX_PAGES_VALID;
+            config.RESOLVE_MAX_PAGES = pages;
+            config.RESOLVE_MAX_PAGES_VALID = true;
+            try {
+                expect(() => CurrentnessService.assertCapability()).toThrow(
+                    expect.objectContaining<Partial<CurrentnessReadError>>({ code: 'CAPABILITY_ABSENT' })
+                );
+                expect(fetchMirrorTopicMessagesJson).not.toHaveBeenCalled();
+            } finally {
+                config.RESOLVE_MAX_PAGES = previousPages;
+                config.RESOLVE_MAX_PAGES_VALID = previousValid;
+            }
+        }
+    );
+
+    it('fails with a typed error when aggregate Mirror response bytes exceed the read budget', async () => {
+        (fetchMirrorTopicMessagesJson as jest.Mock).mockImplementationOnce((_path, _topic, options) => {
+            options.onResponseBytes(CURRENTNESS_MAX_TOTAL_RESPONSE_BYTES + 1);
+            return Promise.resolve({ messages: [] });
+        });
+
+        await expect(CurrentnessService.read(request)).rejects.toMatchObject({
+            name: 'CurrentnessReadError',
+            code: 'UPSTREAM_PERMANENT_FAILURE'
+        });
+        expect(fetchMirrorTopicMessagesJson).toHaveBeenCalledTimes(1);
+    });
+
+    it('fails with a typed error when total Mirror messages exceed the read budget', async () => {
+        const repeated = mirrorMessage(1, binding('0.0.101'));
+        (fetchMirrorTopicMessagesJson as jest.Mock)
+            .mockResolvedValueOnce({ messages: [repeated] })
+            .mockResolvedValueOnce({
+                messages: Array.from({ length: CURRENTNESS_MAX_TOTAL_MESSAGES }, () => repeated),
+                links: {}
+            });
+
+        await expect(CurrentnessService.read(request)).rejects.toMatchObject({
+            name: 'CurrentnessReadError',
+            code: 'UPSTREAM_PERMANENT_FAILURE'
+        });
+    });
 });
 
 describe('POST /v1/currentness authentication', () => {
@@ -575,6 +699,36 @@ describe('POST /v1/currentness authentication', () => {
             expect(response.status).toBe(200);
             expect(body).toMatchObject({ responseVersion: 'v1', disposition: 'CURRENT' });
         } finally {
+            await new Promise<void>((resolve, reject) => {
+                server.close(error => error ? reject(error) : resolve());
+            });
+        }
+    });
+
+    it('preserves CAPABILITY_ABSENT as the producer failure code', async () => {
+        const previous = config.LIFECYCLE_AUTHORITY_ACCOUNT_ID;
+        config.LIFECYCLE_AUTHORITY_ACCOUNT_ID = undefined;
+        const app = createApp();
+        const server = app.listen(0);
+        const address = server.address();
+        if (!address || typeof address === 'string') throw new Error('Test server did not bind.');
+
+        try {
+            const response = await fetch(`http://127.0.0.1:${address.port}/v1/currentness`, {
+                method: 'POST',
+                headers: {
+                    'content-type': 'application/json',
+                    'x-trustmesh-currentness-token': 'reader-secret'
+                },
+                body: JSON.stringify(request)
+            });
+            const body = await response.json() as { code: string };
+
+            expect(response.status).toBe(503);
+            expect(body.code).toBe('CAPABILITY_ABSENT');
+            expect(fetchMirrorTopicMessagesJson).not.toHaveBeenCalled();
+        } finally {
+            config.LIFECYCLE_AUTHORITY_ACCOUNT_ID = previous;
             await new Promise<void>((resolve, reject) => {
                 server.close(error => error ? reject(error) : resolve());
             });
