@@ -82,6 +82,16 @@ const signEvidence = <T extends { provenance: { signature: string } }>(
     return event;
 };
 
+const reverseObjectKeys = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(reverseObjectKeys);
+    if (!value || typeof value !== 'object') return value;
+    return Object.fromEntries(
+        Object.entries(value as Record<string, unknown>)
+            .reverse()
+            .map(([key, nested]) => [key, reverseObjectKeys(nested)])
+    );
+};
+
 const binding = (
     accountId: string,
     issuedAt = '2026-10-23T00:00:00.000Z',
@@ -420,6 +430,23 @@ describe('CurrentnessService conformance', () => {
         const result = await CurrentnessService.read(request);
 
         expect(result.disposition).toBe('REVOKED');
+    });
+
+    it('treats a lifecycle replay with reordered JSON keys as idempotent', async () => {
+        const revoke = lifecycle('IDENTITY_REVOKE', 1, { id: 'reordered-revoke-1' });
+        const reordered = reverseObjectKeys(revoke) as IdentityLifecycleEventV1;
+        expect(JSON.stringify(reordered)).not.toBe(JSON.stringify(revoke));
+        expect(canonicalEvidencePayload(reordered)).toBe(canonicalEvidencePayload(revoke));
+        mockCompleteTopic([
+            mirrorMessage(1, binding('0.0.101')),
+            mirrorMessage(2, revoke, '0.0.700'),
+            mirrorMessage(3, reordered, '0.0.700')
+        ]);
+
+        const result = await CurrentnessService.read(request);
+
+        expect(result.disposition).toBe('REVOKED');
+        expect(result.lifecycle?.lifecycleEventId).toBe('reordered-revoke-1');
     });
 
     it('returns AMBIGUOUS for a duplicate lifecycle id with conflicting content', async () => {

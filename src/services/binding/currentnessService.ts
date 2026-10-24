@@ -532,7 +532,7 @@ export const reduceCurrentness = (
     for (const record of lifecycle.sort((a, b) => a.sequenceNumber - b.sequenceNumber)) {
         const existing = lifecycleById.get(record.event.lifecycleEventId);
         if (existing) {
-            if (JSON.stringify(existing.event) !== JSON.stringify(record.event)) {
+            if (canonicalEvidencePayload(existing.event) !== canonicalEvidencePayload(record.event)) {
                 return makeResponse('AMBIGUOUS', 'CONFLICTING_LINEAGE', identity, observedAt, watermark, watermarkTimestamp, true);
             }
             continue;
