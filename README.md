@@ -95,7 +95,15 @@ lifecycle authorities to be configured.
 `POST /v1/identity-binding/register` is the explicit-consent boundary for a
 Magic-authenticated representative. It uses the existing
 `x-worlds-builder-service-token`; the token must be configured or the route
-fails closed. The strict v1 request contains only the exact canonical DID,
+fails closed. Claim-facing callers must also send
+`x-trustmesh-operation-owner` with the opaque reference of a durable upstream
+operation record. The accepted reference is 1-200 characters and uses only
+letters, digits, `.`, `_`, `:`, `/`, or `-`. WorldsBuilder operation 0034 is
+the designated integration owner: it must durably retain the exact request,
+consent reference, outcome, reconciliation, and claim progression. A header
+assertion is not a substitute for that durable record.
+
+The strict v1 request contains only the exact canonical DID,
 stable identifier, issuer, provider-derived EVM public address, fixed purpose
 `eugene.business.admin.custody`, durable consent receipt reference, idempotency
 key, and request time. It accepts no email, phone, product role, World,
@@ -124,7 +132,23 @@ the exact DID, stable identifier, and issuer and carry signed
 must match the actual Hedera operator account and signing key. Ambiguous,
 revoked, superseded, stale, unsigned, or unverifiable evidence blocks
 registration. Uncertain provider or HCS outcomes return `pending`; they require
-a fresh reconciliation before a later retry.
+a fresh reconciliation before any recovery. A caller must treat `pending` as
+terminal for that operation, persist it, and perform a separate nonmutating
+currentness read. It must not invoke registration again merely as a retry. If
+currentness remains unbound and the durable operation owner grants explicit
+recovery authority, recovery uses a new idempotency key, the same
+`x-trustmesh-operation-owner`, and
+`x-trustmesh-recovery-authority: currentness-reconciled`. The service blocks a
+same-process post-pending attempt without that authority; this is a guardrail,
+not the durable operation record.
+
+Completed idempotency outcomes are retained in process for 15 minutes, with a
+maximum of 1,000 tracked operations. During that window, an exact same-key
+retry returns the same response and changed input with the same key is blocked.
+Capacity is reserved for in-flight operations, so a full registry starts no
+new provider work. This cache is deliberately process-local: it provides no
+cross-instance or restart durability, and the upstream operation owner must
+enforce the recovery rule across those boundaries.
 
 A `bound` result identifies the exact identity, EVM address, Hedera account,
 binding event receipt, resolution source, service version, and bound time. It

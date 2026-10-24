@@ -326,26 +326,37 @@ export const submitToTopic = async (topicId: string, message: string) => {
 
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
+export const classifyMirrorLookupFailure = (error: unknown): string => {
+    if (error instanceof MirrorNodeRequestPolicyError) return error.code;
+    if (error instanceof MirrorNodeHttpError) {
+        return Number.isInteger(error.status) && error.status >= 100 && error.status <= 599
+            ? `MIRROR_HTTP_${error.status}`
+            : 'MIRROR_HTTP_ERROR';
+    }
+    if (error instanceof Error && error.name === 'AbortError') return 'MIRROR_TIMEOUT';
+    if (error instanceof TypeError) return 'MIRROR_NETWORK_ERROR';
+    return 'MIRROR_LOOKUP_ERROR';
+};
+
 export const lookupAccountByEvm = async (evmAddress: string): Promise<string | null> => {
     const normalized = evmAddress.trim().toLowerCase();
 
+    const directPayload = await fetchMirrorJson<{ account?: string }>(`/accounts/${encodeURIComponent(normalized)}`)
+        .catch(() => null);
+
+    if (directPayload?.account) {
+        return directPayload.account;
+    }
+
     try {
-        const directPayload = await fetchMirrorJson<{ account?: string }>(`/accounts/${encodeURIComponent(normalized)}`)
-            .catch(() => null);
-
-        if (directPayload?.account) {
-            return directPayload.account;
-        }
-
         const queryPayload = await fetchMirrorJson<{
             accounts?: Array<{ account?: string }>;
-        }>(`/accounts?account.id=${encodeURIComponent(normalized)}`).catch(() => null);
+        }>(`/accounts?account.id=${encodeURIComponent(normalized)}`);
 
         return queryPayload?.accounts?.[0]?.account ?? null;
     } catch (error) {
-        log.warn('Mirror lookup failed', {
-            evmAddress: normalized,
-            error: error instanceof Error ? error.message : String(error)
+        log.warn('Mirror EVM account lookup failed', {
+            classification: classifyMirrorLookupFailure(error)
         });
         return null;
     }

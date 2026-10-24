@@ -283,7 +283,11 @@ export interface IdentityRegistrationBoundResponseV1 {
 export interface IdentityRegistrationPendingResponseV1 {
     responseVersion: 'v1';
     status: 'pending';
-    reason: 'CURRENTNESS_TEMPORARILY_UNAVAILABLE' | 'PROVIDER_OUTCOME_UNCERTAIN' | 'BINDING_SUBMISSION_UNCERTAIN';
+    reason:
+        | 'CURRENTNESS_TEMPORARILY_UNAVAILABLE'
+        | 'PROVIDER_OUTCOME_UNCERTAIN'
+        | 'BINDING_SUBMISSION_UNCERTAIN'
+        | 'IDEMPOTENCY_CAPACITY_REACHED';
     retryable: true;
     message: string;
 }
@@ -296,6 +300,8 @@ export interface IdentityRegistrationBlockedResponseV1 {
         | 'CURRENTNESS_UNAVAILABLE'
         | 'IDENTITY_CONFLICT'
         | 'IDEMPOTENCY_KEY_REUSE'
+        | 'OPERATION_OWNER_REQUIRED'
+        | 'RECOVERY_AUTHORITY_REQUIRED'
         | 'AUTHORITY_SIGNER_MISMATCH'
         | 'INVALID_AUTHORITY_CONFIGURATION';
     retryable: false;

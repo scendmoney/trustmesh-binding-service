@@ -24,6 +24,86 @@ import type {
 
 const SERVICE_VERSION = packageJson.version;
 const IDENTITY_PURPOSE = 'eugene.business.admin.custody' as const;
+export const IDENTITY_REGISTRATION_COMPLETED_OUTCOME_TTL_MS = 15 * 60 * 1000;
+export const IDENTITY_REGISTRATION_MAX_TRACKED_OPERATIONS = 1000;
+export const IDENTITY_REGISTRATION_RECOVERY_AUTHORITY = 'currentness-reconciled';
+
+export interface IdentityRegistrationInvocation {
+    operationOwnerRef: string;
+    recoveryAuthorized: boolean;
+}
+
+interface CompletedOutcomeEntry {
+    fingerprint: string;
+    response: IdentityRegistrationResponseV1;
+    completedAt: number;
+}
+
+type CompletedOutcomeLookup =
+    | { status: 'miss' }
+    | { status: 'conflict' }
+    | { status: 'hit'; response: IdentityRegistrationResponseV1 };
+
+export class IdentityRegistrationCompletedOutcomeCache {
+    private readonly entries = new Map<string, CompletedOutcomeEntry>();
+
+    constructor(
+        private readonly ttlMs = IDENTITY_REGISTRATION_COMPLETED_OUTCOME_TTL_MS,
+        private readonly maxEntries = IDENTITY_REGISTRATION_MAX_TRACKED_OPERATIONS,
+        private readonly now: () => number = Date.now
+    ) {
+        if (!Number.isSafeInteger(ttlMs) || ttlMs <= 0) {
+            throw new Error('Identity registration idempotency TTL must be a positive safe integer.');
+        }
+        if (!Number.isSafeInteger(maxEntries) || maxEntries <= 0) {
+            throw new Error('Identity registration idempotency capacity must be a positive safe integer.');
+        }
+    }
+
+    lookup(idempotencyKey: string, fingerprint: string): CompletedOutcomeLookup {
+        this.cleanup();
+        const entry = this.entries.get(idempotencyKey);
+        if (!entry) return { status: 'miss' };
+        if (entry.fingerprint !== fingerprint) return { status: 'conflict' };
+        return { status: 'hit', response: entry.response };
+    }
+
+    store(
+        idempotencyKey: string,
+        fingerprint: string,
+        response: IdentityRegistrationResponseV1
+    ): boolean {
+        const completedAt = this.now();
+        this.cleanup(completedAt);
+        if (!this.entries.has(idempotencyKey) && this.entries.size >= this.maxEntries) {
+            return false;
+        }
+        this.entries.set(idempotencyKey, { fingerprint, response, completedAt });
+        return true;
+    }
+
+    hasCapacity(additionalEntries = 1): boolean {
+        this.cleanup();
+        return this.entries.size + additionalEntries <= this.maxEntries;
+    }
+
+    get size(): number {
+        this.cleanup();
+        return this.entries.size;
+    }
+
+    clear(): void {
+        this.entries.clear();
+    }
+
+    private cleanup(at = this.now()): void {
+        for (const [key, entry] of this.entries) {
+            if (at - entry.completedAt >= this.ttlMs) {
+                this.entries.delete(key);
+            }
+        }
+    }
+}
 
 type AuthorityCheck =
     | { ok: true; signer: ReturnType<typeof getHederaOperatorEvidenceSigner> }
@@ -331,17 +411,64 @@ const performRegistration = async (
     }
 };
 
+const identityKeyFor = (input: IdentityRegistrationRequestV1): string =>
+    JSON.stringify([input.canonicalDid, input.stableIdentifier, input.issuer]);
+
+const isValidOperationOwnerRef = (value: string): boolean =>
+    value.length <= 200 && /^[A-Za-z0-9][A-Za-z0-9._:/-]*$/.test(value);
+
 const identityLocks = new Map<string, Promise<void>>();
 const inFlightIdempotency = new Map<string, {
     fingerprint: string;
     operation: Promise<IdentityRegistrationResponseV1>;
 }>();
+const completedOutcomes = new IdentityRegistrationCompletedOutcomeCache();
+const pendingRecoveryGuards = new Map<string, {
+    operationOwnerRef: string;
+    expiresAt: number;
+}>();
+
+const cleanupPendingRecoveryGuards = (at = Date.now()): void => {
+    for (const [key, guard] of pendingRecoveryGuards) {
+        if (at >= guard.expiresAt) pendingRecoveryGuards.delete(key);
+    }
+};
+
+const performProtectedRegistration = async (
+    input: IdentityRegistrationRequestV1,
+    invocation: IdentityRegistrationInvocation
+): Promise<IdentityRegistrationResponseV1> => {
+    cleanupPendingRecoveryGuards();
+    const identityKey = identityKeyFor(input);
+    const recoveryGuard = pendingRecoveryGuards.get(identityKey);
+    if (recoveryGuard) {
+        if (
+            !invocation.recoveryAuthorized ||
+            recoveryGuard.operationOwnerRef !== invocation.operationOwnerRef
+        ) {
+            return blocked(
+                'RECOVERY_AUTHORITY_REQUIRED',
+                'A prior uncertain registration requires owner-authorized currentness reconciliation before recovery.'
+            );
+        }
+        pendingRecoveryGuards.delete(identityKey);
+    }
+
+    const response = await performRegistration(input);
+    if (response.status === 'pending') {
+        pendingRecoveryGuards.set(identityKey, {
+            operationOwnerRef: invocation.operationOwnerRef,
+            expiresAt: Date.now() + IDENTITY_REGISTRATION_COMPLETED_OUTCOME_TTL_MS
+        });
+    }
+    return response;
+};
 
 const serializeByIdentity = async (
     input: IdentityRegistrationRequestV1,
     operation: () => Promise<IdentityRegistrationResponseV1>
 ): Promise<IdentityRegistrationResponseV1> => {
-    const identityKey = JSON.stringify([input.canonicalDid, input.stableIdentifier, input.issuer]);
+    const identityKey = identityKeyFor(input);
     const previous = identityLocks.get(identityKey) ?? Promise.resolve();
     let release = (): void => undefined;
     const current = new Promise<void>(resolve => { release = resolve; });
@@ -358,9 +485,18 @@ const serializeByIdentity = async (
 };
 
 export class IdentityRegistrationService {
-    static async register(input: IdentityRegistrationRequestV1): Promise<IdentityRegistrationResponseV1> {
+    static async register(
+        input: IdentityRegistrationRequestV1,
+        invocation: IdentityRegistrationInvocation
+    ): Promise<IdentityRegistrationResponseV1> {
         if (input.purpose !== IDENTITY_PURPOSE) {
             return blocked('IDENTITY_CONFLICT', 'Identity registration purpose is not authorized.');
+        }
+        if (!invocation || !isValidOperationOwnerRef(invocation.operationOwnerRef)) {
+            return blocked(
+                'OPERATION_OWNER_REQUIRED',
+                'A valid durable upstream operation-owner reference is required.'
+            );
         }
 
         const fingerprint = JSON.stringify([
@@ -371,8 +507,17 @@ export class IdentityRegistrationService {
             input.evmPublicAddress,
             input.purpose,
             input.consentReceiptRef,
-            input.requestedAt
+            input.requestedAt,
+            invocation.operationOwnerRef,
+            invocation.recoveryAuthorized
         ]);
+
+        const completed = completedOutcomes.lookup(input.idempotencyKey, fingerprint);
+        if (completed.status === 'conflict') {
+            return blocked('IDEMPOTENCY_KEY_REUSE', 'Idempotency key was reused with different registration input.');
+        }
+        if (completed.status === 'hit') return completed.response;
+
         const prior = inFlightIdempotency.get(input.idempotencyKey);
         if (prior) {
             if (prior.fingerprint !== fingerprint) {
@@ -381,15 +526,36 @@ export class IdentityRegistrationService {
             return prior.operation;
         }
 
-        const operation = serializeByIdentity(input, () => performRegistration(input))
-            .catch(() => blocked('CURRENTNESS_UNAVAILABLE', 'Identity registration failed closed.'));
-        inFlightIdempotency.set(input.idempotencyKey, { fingerprint, operation });
-        try {
-            return await operation;
-        } finally {
-            if (inFlightIdempotency.get(input.idempotencyKey)?.operation === operation) {
-                inFlightIdempotency.delete(input.idempotencyKey);
-            }
+        if (!completedOutcomes.hasCapacity(inFlightIdempotency.size + 1)) {
+            return pending(
+                'IDEMPOTENCY_CAPACITY_REACHED',
+                'Process-local idempotency capacity is occupied; no registration work was started.'
+            );
         }
+
+        let operation: Promise<IdentityRegistrationResponseV1>;
+        operation = serializeByIdentity(input, () => performProtectedRegistration(input, invocation))
+            .catch(() => blocked('CURRENTNESS_UNAVAILABLE', 'Identity registration failed closed.'))
+            .then(response => {
+                completedOutcomes.store(input.idempotencyKey, fingerprint, response);
+                return response;
+            })
+            .finally(() => {
+                if (inFlightIdempotency.get(input.idempotencyKey)?.operation === operation) {
+                    inFlightIdempotency.delete(input.idempotencyKey);
+                }
+            });
+        inFlightIdempotency.set(input.idempotencyKey, { fingerprint, operation });
+        return operation;
+    }
+
+    static resetProcessLocalStateForTests(): void {
+        if (config.NODE_ENV !== 'test') {
+            throw new Error('Identity registration process state can only be reset in tests.');
+        }
+        identityLocks.clear();
+        inFlightIdempotency.clear();
+        completedOutcomes.clear();
+        pendingRecoveryGuards.clear();
     }
 }

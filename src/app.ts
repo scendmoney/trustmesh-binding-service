@@ -8,7 +8,10 @@ import { ResolveService } from './services/binding/resolveService';
 import { BindingService } from './services/binding/bindingService';
 import { FounderBindingService } from './services/binding/founderBindingService';
 import { CurrentnessReadError, CurrentnessService } from './services/binding/currentnessService';
-import { IdentityRegistrationService } from './services/binding/identityRegistrationService';
+import {
+    IDENTITY_REGISTRATION_RECOVERY_AUTHORITY,
+    IdentityRegistrationService
+} from './services/binding/identityRegistrationService';
 import { z } from 'zod';
 
 export const createApp = () => {
@@ -217,15 +220,34 @@ export const createApp = () => {
             return;
         }
 
+        const operationOwnerRef = req.header('x-trustmesh-operation-owner') ?? '';
+        const recoveryAuthority = req.header('x-trustmesh-recovery-authority');
+        if (recoveryAuthority && recoveryAuthority !== IDENTITY_REGISTRATION_RECOVERY_AUTHORITY) {
+            res.status(400).json({
+                responseVersion: 'v1',
+                status: 'blocked',
+                reason: 'INVALID_RECOVERY_AUTHORITY',
+                retryable: false,
+                message: 'Identity registration recovery authority is invalid.'
+            });
+            return;
+        }
+
         try {
             const body = identityRegistrationSchema.parse(req.body);
-            const result = await IdentityRegistrationService.register(body);
+            const result = await IdentityRegistrationService.register(body, {
+                operationOwnerRef,
+                recoveryAuthorized: recoveryAuthority === IDENTITY_REGISTRATION_RECOVERY_AUTHORITY
+            });
             const status = result.status === 'bound'
                 ? 200
                 : result.status === 'pending'
                     ? 202
+                    : result.reason === 'OPERATION_OWNER_REQUIRED'
+                        ? 428
                     : result.reason === 'IDENTITY_CONFLICT' ||
                         result.reason === 'IDEMPOTENCY_KEY_REUSE' ||
+                        result.reason === 'RECOVERY_AUTHORITY_REQUIRED' ||
                         result.reason === 'CURRENTNESS_NOT_CURRENT'
                         ? 409
                         : 503;
