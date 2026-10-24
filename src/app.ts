@@ -8,6 +8,7 @@ import { ResolveService } from './services/binding/resolveService';
 import { BindingService } from './services/binding/bindingService';
 import { FounderBindingService } from './services/binding/founderBindingService';
 import { CurrentnessReadError, CurrentnessService } from './services/binding/currentnessService';
+import { IdentityRegistrationService } from './services/binding/identityRegistrationService';
 import { z } from 'zod';
 
 export const createApp = () => {
@@ -70,6 +71,18 @@ export const createApp = () => {
             stableIdentifier: z.string().min(1),
             issuer: z.string().min(1)
         }).strict()
+    }).strict();
+
+    const identityRegistrationSchema = z.object({
+        requestVersion: z.literal('v1'),
+        canonicalDid: z.string().min(1).max(512).refine(value => value.trim().length > 0),
+        stableIdentifier: z.string().min(1).max(512).refine(value => value.trim().length > 0),
+        issuer: z.string().min(1).max(512).refine(value => value.trim().length > 0),
+        evmPublicAddress: z.string().regex(/^0x[a-fA-F0-9]{40}$/),
+        purpose: z.literal('eugene.business.admin.custody'),
+        consentReceiptRef: z.string().min(1).max(1024).refine(value => value.trim().length > 0),
+        idempotencyKey: z.string().min(1).max(200).refine(value => value.trim().length > 0),
+        requestedAt: z.string().datetime({ offset: true })
     }).strict();
 
     const requireWorldsBuilderToken = (req: express.Request): boolean => {
@@ -178,6 +191,65 @@ export const createApp = () => {
                 status: 'unbound',
                 reason: 'serviceUnavailable',
                 message: 'Founder binding route failed.'
+            });
+        }
+    });
+
+    app.post('/v1/identity-binding/register', writeLimiter, async (req, res) => {
+        if (!config.WORLDS_BUILDER_SERVICE_TOKEN) {
+            res.status(503).json({
+                responseVersion: 'v1',
+                status: 'blocked',
+                reason: 'SERVICE_AUTHENTICATION_UNAVAILABLE',
+                retryable: false,
+                message: 'Identity registration authentication is not configured.'
+            });
+            return;
+        }
+        if (req.header('x-worlds-builder-service-token') !== config.WORLDS_BUILDER_SERVICE_TOKEN) {
+            res.status(401).json({
+                responseVersion: 'v1',
+                status: 'blocked',
+                reason: 'AUTHENTICATION_FAILURE',
+                retryable: false,
+                message: 'Missing or invalid Worlds Builder service token.'
+            });
+            return;
+        }
+
+        try {
+            const body = identityRegistrationSchema.parse(req.body);
+            const result = await IdentityRegistrationService.register(body);
+            const status = result.status === 'bound'
+                ? 200
+                : result.status === 'pending'
+                    ? 202
+                    : result.reason === 'IDENTITY_CONFLICT' ||
+                        result.reason === 'IDEMPOTENCY_KEY_REUSE' ||
+                        result.reason === 'CURRENTNESS_NOT_CURRENT'
+                        ? 409
+                        : 503;
+            res.status(status).json(result);
+        } catch (error) {
+            if (error instanceof z.ZodError) {
+                res.status(400).json({
+                    responseVersion: 'v1',
+                    status: 'blocked',
+                    reason: 'INVALID_REQUEST',
+                    retryable: false,
+                    message: 'Invalid identity registration request.',
+                    details: error.errors
+                });
+                return;
+            }
+
+            log.error('Identity registration route failed');
+            res.status(500).json({
+                responseVersion: 'v1',
+                status: 'blocked',
+                reason: 'INTERNAL_FAILURE',
+                retryable: false,
+                message: 'Identity registration failed closed.'
             });
         }
     });

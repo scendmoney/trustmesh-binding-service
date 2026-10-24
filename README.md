@@ -31,6 +31,7 @@ pnpm dev
 - `GET /v1/resolve`
 - `GET /v1/status`
 - `POST /v1/bind`
+- `POST /v1/identity-binding/register` (authenticated, explicit-consent registration)
 - `POST /v1/currentness` (authenticated, read-only, complete-history lifecycle reduction)
 
 ## 🔒 Security
@@ -82,10 +83,54 @@ Canonical DID, stable identifier, and issuer comparisons are exact under
 Lifecycle effective time is the HCS consensus timestamp; payload timestamps do
 not schedule or backdate an effect.
 
-No production binding or lifecycle signing key or writer is configured or
-activated by this repository. Existing write paths remain unchanged and emit
-legacy unsigned records. Until both evidence authorities are explicitly
-configured, the endpoint reports `CAPABILITY_ABSENT`.
+No production binding or lifecycle authority is designated by this repository.
+The existing legacy write paths remain unchanged and emit unsigned records;
+those records cannot produce `CURRENT`. The identity-registration route signs
+new evidence only when the binding authority is configured and matches the
+actual Hedera operator signer. Currentness still requires both binding and
+lifecycle authorities to be configured.
+
+## Identity registration v1
+
+`POST /v1/identity-binding/register` is the explicit-consent boundary for a
+Magic-authenticated representative. It uses the existing
+`x-worlds-builder-service-token`; the token must be configured or the route
+fails closed. The strict v1 request contains only the exact canonical DID,
+stable identifier, issuer, provider-derived EVM public address, fixed purpose
+`eugene.business.admin.custody`, durable consent receipt reference, idempotency
+key, and request time. It accepts no email, phone, product role, World,
+Organism, or founding-steward assertion.
+
+```json
+{
+  "requestVersion": "v1",
+  "canonicalDid": "did:magic:issuer:subject",
+  "stableIdentifier": "issuer:subject",
+  "issuer": "https://issuer.example",
+  "evmPublicAddress": "0x1111111111111111111111111111111111111111",
+  "purpose": "eugene.business.admin.custody",
+  "consentReceiptRef": "cw-consent:receipt-id",
+  "idempotencyKey": "registration-request-id",
+  "requestedAt": "2026-10-24T18:00:00.000Z"
+}
+```
+
+The route first performs a complete fresh currentness read. A current exact
+binding is returned with its existing event receipt. For an unbound identity,
+the service reconciles the EVM alias before it submits an `IDENTITY_ASSERT` or
+provisions an account and submits an `IDENTITY_BIND`. Both event forms preserve
+the exact DID, stable identifier, and issuer and carry signed
+`EvidenceProvenanceV1`. The configured binding authority account and public key
+must match the actual Hedera operator account and signing key. Ambiguous,
+revoked, superseded, stale, unsigned, or unverifiable evidence blocks
+registration. Uncertain provider or HCS outcomes return `pending`; they require
+a fresh reconciliation before a later retry.
+
+A `bound` result identifies the exact identity, EVM address, Hedera account,
+binding event receipt, resolution source, service version, and bound time. It
+does not authorize or submit a business claim. After receiving the receipt, the
+consumer must separately call nonmutating `POST /v1/currentness` and require a
+fresh `CURRENT` response before separately submitting the claim.
 
 ## 🌍 Deployment
 

@@ -8,7 +8,7 @@ import type {
     CurrentnessRequest,
     CurrentnessResponse,
     EvidenceProvenanceV1,
-    FounderBindingEnvelope,
+    BindingEvidenceEnvelopeV1,
     IdentityLifecycleEventV1
 } from './types';
 
@@ -96,6 +96,7 @@ const uniqueSequenceStream = (
 
 type BindingRecord = {
     accountId: string;
+    evmPublicAddress: string;
     ref: BindingReference;
     sourceEventAt: string;
     effectiveAt: string;
@@ -198,17 +199,18 @@ const bindingRef = (
     normalizationVersion: 'exact-v1'
 });
 
-const isBindingEnvelope = (value: unknown): value is FounderBindingEnvelope => {
+const isBindingEnvelope = (value: unknown): value is BindingEvidenceEnvelopeV1 => {
     if (!value || typeof value !== 'object') return false;
-    const event = value as Partial<FounderBindingEnvelope>;
+    const event = value as Partial<BindingEvidenceEnvelopeV1>;
     return (event.t === 'IDENTITY_BIND' || event.t === 'IDENTITY_ASSERT') &&
         event.v === 1 &&
-        typeof event.sub === 'string' &&
+        typeof event.sub === 'string' && event.sub.length > 0 &&
         isIsoTimestamp(event.iat) &&
         (event.chain === 'testnet' || event.chain === 'mainnet' || event.chain === 'previewnet') &&
         !!event.payload &&
-        typeof event.payload.stable_identifier === 'string' &&
-        typeof event.payload.issuer === 'string' &&
+        typeof event.payload.stable_identifier === 'string' && event.payload.stable_identifier.length > 0 &&
+        typeof event.payload.issuer === 'string' && event.payload.issuer.length > 0 &&
+        typeof event.payload.evm_address === 'string' && /^0x[a-fA-F0-9]{40}$/.test(event.payload.evm_address) &&
         typeof event.payload.hedera_account_id === 'string' &&
         /^0\.0\.\d+$/.test(event.payload.hedera_account_id);
 };
@@ -331,6 +333,7 @@ const makeResponse = (
     binding: binding ? {
         hederaAccountId: binding.accountId,
         bindingEventId: binding.ref.bindingEventId,
+        evmPublicAddress: binding.evmPublicAddress,
         sourceEventAt: binding.sourceEventAt,
         effectiveAt: binding.effectiveAt,
         authorityAccountId: binding.provenance.authorityAccountId,
@@ -413,10 +416,10 @@ export const reduceCurrentness = (
         const raw = decode(message.message);
         if (!raw || typeof raw !== 'object') continue;
 
-        const possibleBinding = raw as Partial<FounderBindingEnvelope>;
+        const possibleBinding = raw as Partial<BindingEvidenceEnvelopeV1>;
         if (possibleBinding.t === 'IDENTITY_BIND' || possibleBinding.t === 'IDENTITY_ASSERT') {
             if (!isBindingEnvelope(raw)) {
-                const partialPayload = possibleBinding.payload as Partial<FounderBindingEnvelope['payload']> | undefined;
+                const partialPayload = possibleBinding.payload as Partial<BindingEvidenceEnvelopeV1['payload']> | undefined;
                 if (touchesIdentity({
                     canonicalDid: possibleBinding.sub,
                     stableIdentifier: partialPayload?.stable_identifier,
@@ -448,6 +451,7 @@ export const reduceCurrentness = (
                 }
                 bindings.push({
                     accountId: raw.payload.hedera_account_id,
+                    evmPublicAddress: raw.payload.evm_address,
                     ref: bindingRef(identity, message),
                     sourceEventAt: raw.iat,
                     effectiveAt: consensusIso(message.consensus_timestamp),

@@ -1,4 +1,5 @@
 import { AccountId, Client, Hbar, PrivateKey, TopicMessageSubmitTransaction, TransferTransaction } from '@hashgraph/sdk';
+import { hashMessage, SigningKey } from 'ethers';
 import { config } from '../../config';
 import { log } from '../../util/log';
 
@@ -117,6 +118,59 @@ export class MirrorNodeHttpError extends Error {
         this.name = 'MirrorNodeHttpError';
     }
 }
+
+export type EvmAliasReconciliation =
+    | { status: 'resolved'; hederaAccountId: string }
+    | { status: 'absent' }
+    | { status: 'unknown' };
+
+export const reconcileEvmAlias = async (evmAddress: string): Promise<EvmAliasReconciliation> => {
+    try {
+        const result = await fetchMirrorJson<{ account?: unknown }>(
+            `/accounts/${encodeURIComponent(evmAddress.toLowerCase())}`
+        );
+        if (typeof result.account === 'string' && /^0\.0\.\d+$/.test(result.account)) {
+            return { status: 'resolved', hederaAccountId: result.account };
+        }
+        return { status: 'unknown' };
+    } catch (error) {
+        if (error instanceof MirrorNodeHttpError && error.status === 404) {
+            return { status: 'absent' };
+        }
+        return { status: 'unknown' };
+    }
+};
+
+export interface HederaOperatorEvidenceSigner {
+    accountId: string;
+    publicKey: string;
+    signMessage(message: string): string;
+}
+
+export const getHederaOperatorEvidenceSigner = (): HederaOperatorEvidenceSigner => {
+    try {
+        const operatorKey = parseOperatorKey(config.HEDERA_OPERATOR_KEY);
+        if (PrivateKey.getAlgorithm(operatorKey.toStringDer()) !== 'ecdsa') {
+            throw new Error('Binding evidence requires an ECDSA Hedera operator.');
+        }
+        const rawPrivateKey = operatorKey.toStringRaw();
+        const signingKey = new SigningKey(rawPrivateKey.startsWith('0x') ? rawPrivateKey : `0x${rawPrivateKey}`);
+        const operatorPublicKey = operatorKey.publicKey.toStringRaw();
+        if (
+            SigningKey.computePublicKey(`0x${operatorPublicKey.replace(/^0x/, '')}`, false) !==
+            SigningKey.computePublicKey(signingKey.publicKey, false)
+        ) {
+            throw new Error('EIP-191 signer does not match the Hedera operator key.');
+        }
+        return {
+            accountId: AccountId.fromString(config.HEDERA_OPERATOR_ID).toString(),
+            publicKey: signingKey.publicKey,
+            signMessage: message => signingKey.sign(hashMessage(message)).serialized
+        };
+    } catch {
+        throw new Error('The configured Hedera operator cannot sign EIP-191 binding evidence.');
+    }
+};
 
 const readResponseBytes = async (response: Response, maxResponseBytes: number): Promise<Buffer> => {
     const responseHeaders = (response as Response & { headers?: Headers }).headers;

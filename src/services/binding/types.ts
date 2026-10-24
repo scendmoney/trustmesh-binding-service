@@ -113,6 +113,26 @@ export interface FounderBindingEnvelope {
     provenance?: EvidenceProvenanceV1;
 }
 
+export interface IdentityRegistrationBindingEnvelopeV1 {
+    t: 'IDENTITY_BIND' | 'IDENTITY_ASSERT';
+    v: 1;
+    sub: string;
+    iat: string;
+    chain: 'testnet' | 'mainnet' | 'previewnet';
+    payload: {
+        stable_identifier: string;
+        issuer: string;
+        evm_address: string;
+        hedera_account_id: string;
+        resolution_source: 'provider-existing' | 'provider-provisioned';
+        consent_receipt_ref: string;
+        requested_at: string;
+    };
+    provenance: EvidenceProvenanceV1;
+}
+
+export type BindingEvidenceEnvelopeV1 = FounderBindingEnvelope | IdentityRegistrationBindingEnvelopeV1;
+
 // Contract: docs/IDENTITY_CURRENTNESS_V1.md
 export interface EvidenceProvenanceV1 {
     schemaVersion: 1;
@@ -193,6 +213,7 @@ export interface CurrentnessResponse {
     binding: {
         hederaAccountId: string;
         bindingEventId: string;
+        evmPublicAddress: string;
         sourceEventAt: string;
         effectiveAt: string;
         authorityAccountId: string;
@@ -227,6 +248,64 @@ export interface CurrentnessResponse {
         coverageComplete: boolean;
     };
 }
+
+export interface IdentityRegistrationRequestV1 extends CurrentnessIdentity {
+    requestVersion: 'v1';
+    evmPublicAddress: string;
+    purpose: 'eugene.business.admin.custody';
+    consentReceiptRef: string;
+    idempotencyKey: string;
+    requestedAt: string;
+}
+
+export type IdentityRegistrationResolutionSource =
+    | 'currentness-reconciled'
+    | 'provider-existing'
+    | 'provider-provisioned';
+
+export interface IdentityRegistrationBoundResponseV1 {
+    responseVersion: 'v1';
+    status: 'bound';
+    identity: CurrentnessIdentity;
+    evmPublicAddress: string;
+    hederaAccountId: string;
+    bindingEventReceipt: {
+        topicId: string;
+        sequenceNumber: string;
+        bindingEventId: string;
+        transactionId: string | null;
+    };
+    resolutionSource: IdentityRegistrationResolutionSource;
+    serviceVersion: string;
+    boundAt: string;
+}
+
+export interface IdentityRegistrationPendingResponseV1 {
+    responseVersion: 'v1';
+    status: 'pending';
+    reason: 'CURRENTNESS_TEMPORARILY_UNAVAILABLE' | 'PROVIDER_OUTCOME_UNCERTAIN' | 'BINDING_SUBMISSION_UNCERTAIN';
+    retryable: true;
+    message: string;
+}
+
+export interface IdentityRegistrationBlockedResponseV1 {
+    responseVersion: 'v1';
+    status: 'blocked';
+    reason:
+        | 'CURRENTNESS_NOT_CURRENT'
+        | 'CURRENTNESS_UNAVAILABLE'
+        | 'IDENTITY_CONFLICT'
+        | 'IDEMPOTENCY_KEY_REUSE'
+        | 'AUTHORITY_SIGNER_MISMATCH'
+        | 'INVALID_AUTHORITY_CONFIGURATION';
+    retryable: false;
+    message: string;
+}
+
+export type IdentityRegistrationResponseV1 =
+    | IdentityRegistrationBoundResponseV1
+    | IdentityRegistrationPendingResponseV1
+    | IdentityRegistrationBlockedResponseV1;
 
 export type CurrentnessFailureCode =
     | 'INVALID_REQUEST'

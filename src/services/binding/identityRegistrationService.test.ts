@@ -1,0 +1,442 @@
+import { config } from '../../config';
+import { CurrentnessService, canonicalEvidencePayload } from './currentnessService';
+import { IdentityRegistrationService } from './identityRegistrationService';
+import { createApp } from '../../app';
+import {
+    fetchMirrorTopicMessagesJson,
+    getHederaOperatorEvidenceSigner,
+    provisionAccountForEvmAlias,
+    reconcileEvmAlias,
+    submitToTopic
+} from '../hedera/client';
+import { computeAddress, hashMessage, SigningKey, verifyMessage } from 'ethers';
+import type { IdentityRegistrationBindingEnvelopeV1 } from './types';
+
+const BINDING_PRIVATE_KEY = `0x${'11'.repeat(32)}`;
+const OTHER_PRIVATE_KEY = `0x${'33'.repeat(32)}`;
+const bindingSigningKey = new SigningKey(BINDING_PRIVATE_KEY);
+
+jest.mock('../../config', () => ({
+    RESOLVE_MAX_PAGES_HARD_MAX: 50,
+    config: {
+        NODE_ENV: 'test',
+        HEDERA_NETWORK: 'testnet',
+        HEDERA_OPERATOR_ID: '0.0.600',
+        HEDERA_OPERATOR_KEY: `0x${'11'.repeat(32)}`,
+        IDENTITY_TOPIC_ID: '0.0.999',
+        RESOLVE_MAX_PAGES: 5,
+        RESOLVE_MAX_PAGES_VALID: true,
+        CURRENTNESS_VALIDITY_MS: 30000,
+        CURRENTNESS_SERVICE_TOKEN: 'reader-secret',
+        BINDING_EVIDENCE_AUTHORITY_ACCOUNT_ID: '0.0.600',
+        BINDING_EVIDENCE_AUTHORITY_KEY_ID: 'binding-key-v1',
+        BINDING_EVIDENCE_AUTHORITY_PUBLIC_KEY: '0x044f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aa385b6b1b8ead809ca67454d9683fcf2ba03456d6fe2c4abe2b07f0fbdbb2f1c1',
+        BINDING_EVIDENCE_AUTHORIZATION_BASIS: 'strategy-ruling-eugene-t1',
+        LIFECYCLE_AUTHORITY_ACCOUNT_ID: '0.0.700',
+        LIFECYCLE_AUTHORITY_KEY_ID: 'lifecycle-key-v1',
+        LIFECYCLE_AUTHORITY_PUBLIC_KEY: '0x04466d7fcae563e5cb09a0d1870bb580344804617879a14949cf22285f1bae3f276728176c3c6431f8eeda4538dc37c865e2784f3a9e77d044f33e407797e1278a',
+        LIFECYCLE_AUTHORIZATION_BASIS: 'strategy-ruling-eugene-t1',
+        WORLDS_BUILDER_SERVICE_TOKEN: 'worlds-builder-secret',
+        CORS_ORIGINS: '*',
+        MIRROR_NODE_TIMEOUT_MS: 100,
+        MIRROR_NODE_AUTH_TYPE: 'none',
+        MIRROR_NODE_URL: 'http://127.0.0.1:1234/api/v1',
+        MIRROR_NODE_AUTH_TOKEN: undefined
+    }
+}));
+
+jest.mock('../../util/log', () => ({ log: { error: jest.fn(), warn: jest.fn(), info: jest.fn() } }));
+
+jest.mock('../hedera/client', () => ({
+    fetchMirrorTopicMessagesJson: jest.fn(),
+    getHederaOperatorEvidenceSigner: jest.fn(),
+    provisionAccountForEvmAlias: jest.fn(),
+    reconcileEvmAlias: jest.fn(),
+    submitToTopic: jest.fn()
+}));
+
+const identity = {
+    canonicalDid: 'did:magic:issuer:user-1',
+    stableIdentifier: 'issuer:user-1',
+    issuer: 'https://issuer.example'
+};
+
+const request = {
+    requestVersion: 'v1' as const,
+    ...identity,
+    evmPublicAddress: '0x1111111111111111111111111111111111111111',
+    purpose: 'eugene.business.admin.custody' as const,
+    consentReceiptRef: 'cw-consent:receipt-01',
+    idempotencyKey: 'registration-01',
+    requestedAt: '2026-10-24T18:00:00.000Z'
+};
+
+type TopicMessage = {
+    consensus_timestamp: string;
+    topic_id: string;
+    sequence_number: number;
+    payer_account_id?: string;
+    message: string;
+};
+
+let topicHistory: TopicMessage[];
+
+const signedEvidence = (
+    overrides: Partial<Pick<IdentityRegistrationBindingEnvelopeV1, 'sub' | 'payload'>> = {}
+): IdentityRegistrationBindingEnvelopeV1 => {
+    const event: IdentityRegistrationBindingEnvelopeV1 = {
+        t: 'IDENTITY_BIND',
+        v: 1,
+        sub: identity.canonicalDid,
+        iat: '2026-10-24T18:01:00.000Z',
+        chain: 'testnet',
+        payload: {
+            stable_identifier: identity.stableIdentifier,
+            issuer: identity.issuer,
+            evm_address: request.evmPublicAddress,
+            hedera_account_id: '0.0.701',
+            resolution_source: 'provider-provisioned',
+            consent_receipt_ref: request.consentReceiptRef,
+            requested_at: request.requestedAt
+        },
+        provenance: {
+            schemaVersion: 1,
+            authorityAccountId: '0.0.600',
+            authorityKeyId: 'binding-key-v1',
+            authorizationBasis: 'strategy-ruling-eugene-t1',
+            authorizationBasisVersion: 'v1',
+            signatureAlgorithm: 'EIP191_SECP256K1',
+            scope: {
+                purpose: 'TRUSTMESH_IDENTITY_CURRENTNESS',
+                network: 'testnet',
+                topicId: '0.0.999',
+                schemaVersion: 1,
+                normalizationVersion: 'exact-v1'
+            },
+            signature: ''
+        }
+    };
+    Object.assign(event, overrides);
+    event.provenance.signature = bindingSigningKey.sign(hashMessage(canonicalEvidencePayload(event))).serialized;
+    return event;
+};
+
+const mirrorMessage = (sequence: number, event: unknown): TopicMessage => ({
+    consensus_timestamp: `${1792864800 + sequence}.000000000`,
+    topic_id: '0.0.999',
+    sequence_number: sequence,
+    payer_account_id: '0.0.600',
+    message: Buffer.from(JSON.stringify(event)).toString('base64')
+});
+
+const pushTopicEvent = (event: unknown): TopicMessage => {
+    const message = mirrorMessage(topicHistory.length + 1, event);
+    topicHistory.push(message);
+    return message;
+};
+
+const configureTopicReader = (): void => {
+    (fetchMirrorTopicMessagesJson as jest.Mock).mockImplementation(async (path: string) => {
+        const newest = [...topicHistory].sort((a, b) => b.sequence_number - a.sequence_number)[0];
+        return path.includes('limit=1')
+            ? { messages: newest ? [newest] : [], links: {} }
+            : { messages: [...topicHistory].sort((a, b) => b.sequence_number - a.sequence_number), links: {} };
+    });
+};
+
+const configureSigner = (privateKey = BINDING_PRIVATE_KEY): void => {
+    const signer = new SigningKey(privateKey);
+    (getHederaOperatorEvidenceSigner as jest.Mock).mockReturnValue({
+        accountId: '0.0.600',
+        publicKey: signer.publicKey,
+        signMessage: (message: string) => signer.sign(hashMessage(message)).serialized
+    });
+};
+
+beforeEach(() => {
+    jest.clearAllMocks();
+    topicHistory = [];
+    configureTopicReader();
+    configureSigner();
+    (reconcileEvmAlias as jest.Mock).mockResolvedValue({ status: 'absent' });
+    (provisionAccountForEvmAlias as jest.Mock).mockResolvedValue({
+        hederaAccountId: '0.0.701',
+        transactionId: '0.0.600@1792864800.000000000'
+    });
+    (submitToTopic as jest.Mock).mockImplementation(async (_topic: string, message: string) => {
+        const event = JSON.parse(message) as IdentityRegistrationBindingEnvelopeV1;
+        const stored = pushTopicEvent(event);
+        return {
+            status: 'SUCCESS',
+            transactionId: `0.0.600@1792864801.${String(stored.sequence_number).padStart(9, '0')}`,
+            sequenceNumber: String(stored.sequence_number)
+        };
+    });
+    config.BINDING_EVIDENCE_AUTHORITY_ACCOUNT_ID = '0.0.600';
+    config.BINDING_EVIDENCE_AUTHORITY_KEY_ID = 'binding-key-v1';
+    config.BINDING_EVIDENCE_AUTHORITY_PUBLIC_KEY = bindingSigningKey.publicKey;
+    config.BINDING_EVIDENCE_AUTHORIZATION_BASIS = 'strategy-ruling-eugene-t1';
+});
+
+describe('IdentityRegistrationService', () => {
+    it('creates a signed generic binding and the receipt reads as fresh CURRENT', async () => {
+        const registered = await IdentityRegistrationService.register(request);
+
+        expect(registered).toMatchObject({
+            responseVersion: 'v1',
+            status: 'bound',
+            identity,
+            evmPublicAddress: request.evmPublicAddress,
+            hederaAccountId: '0.0.701',
+            resolutionSource: 'provider-provisioned',
+            bindingEventReceipt: {
+                topicId: '0.0.999',
+                sequenceNumber: '1',
+                bindingEventId: '0.0.999:1'
+            }
+        });
+        expect(topicHistory).toHaveLength(1);
+        const event = JSON.parse(Buffer.from(topicHistory[0].message, 'base64').toString('utf8')) as IdentityRegistrationBindingEnvelopeV1;
+        expect(event).toMatchObject({
+            t: 'IDENTITY_BIND',
+            sub: identity.canonicalDid,
+            payload: {
+                stable_identifier: identity.stableIdentifier,
+                issuer: identity.issuer,
+                evm_address: request.evmPublicAddress,
+                consent_receipt_ref: request.consentReceiptRef,
+                requested_at: request.requestedAt
+            }
+        });
+        expect(event.payload).not.toHaveProperty('requested_role');
+        expect(event.payload).not.toHaveProperty('organism_id');
+        expect(event.provenance.signature).toMatch(/^0x[0-9a-f]+$/i);
+
+        const currentness = await CurrentnessService.read({ requestVersion: 'v1', identity });
+        expect(currentness).toMatchObject({
+            disposition: 'CURRENT',
+            binding: {
+                hederaAccountId: '0.0.701',
+                bindingEventId: '0.0.999:1',
+                evmPublicAddress: request.evmPublicAddress
+            }
+        });
+        expect(provisionAccountForEvmAlias).toHaveBeenCalledTimes(1);
+    });
+
+    it('reuses an existing exact current binding without provisioning or submitting', async () => {
+        pushTopicEvent(signedEvidence());
+
+        const result = await IdentityRegistrationService.register(request);
+
+        expect(result).toMatchObject({
+            status: 'bound',
+            resolutionSource: 'currentness-reconciled',
+            hederaAccountId: '0.0.701',
+            bindingEventReceipt: { bindingEventId: '0.0.999:1', transactionId: null }
+        });
+        expect(provisionAccountForEvmAlias).not.toHaveBeenCalled();
+        expect(submitToTopic).not.toHaveBeenCalled();
+    });
+
+    it('records a signed assertion when the provider already resolves the EVM alias', async () => {
+        (reconcileEvmAlias as jest.Mock).mockResolvedValue({ status: 'resolved', hederaAccountId: '0.0.701' });
+
+        const result = await IdentityRegistrationService.register(request);
+        const event = JSON.parse(Buffer.from(topicHistory[0].message, 'base64').toString('utf8')) as IdentityRegistrationBindingEnvelopeV1;
+
+        expect(result).toMatchObject({ status: 'bound', resolutionSource: 'provider-existing' });
+        expect(event.t).toBe('IDENTITY_ASSERT');
+        expect(event.payload.resolution_source).toBe('provider-existing');
+        expect(provisionAccountForEvmAlias).not.toHaveBeenCalled();
+    });
+
+    it('blocks a current identity binding whose exact EVM address differs', async () => {
+        pushTopicEvent(signedEvidence({
+            payload: { ...signedEvidence().payload, evm_address: '0x2222222222222222222222222222222222222222' }
+        }));
+
+        const result = await IdentityRegistrationService.register(request);
+
+        expect(result).toMatchObject({ status: 'blocked', reason: 'IDENTITY_CONFLICT' });
+        expect(reconcileEvmAlias).not.toHaveBeenCalled();
+        expect(submitToTopic).not.toHaveBeenCalled();
+    });
+
+    it.each([
+        ['subject', { sub: 'did:magic:issuer:other-user' }],
+        ['issuer', { payload: { ...signedEvidence().payload, issuer: 'https://other-issuer.example' } }]
+    ])('blocks exact %s mismatch in existing evidence', async (_label, override) => {
+        pushTopicEvent(signedEvidence(override));
+
+        const result = await IdentityRegistrationService.register(request);
+
+        expect(result).toMatchObject({ status: 'blocked', reason: 'CURRENTNESS_NOT_CURRENT' });
+        expect(reconcileEvmAlias).not.toHaveBeenCalled();
+        expect(provisionAccountForEvmAlias).not.toHaveBeenCalled();
+        expect(submitToTopic).not.toHaveBeenCalled();
+    });
+
+    it('makes an idempotent retry return the same attributable event', async () => {
+        const first = await IdentityRegistrationService.register(request);
+        const retry = await IdentityRegistrationService.register(request);
+
+        expect(retry).toMatchObject({
+            status: 'bound',
+            resolutionSource: 'currentness-reconciled',
+            hederaAccountId: first.status === 'bound' ? first.hederaAccountId : undefined,
+            bindingEventReceipt: {
+                bindingEventId: first.status === 'bound' ? first.bindingEventReceipt.bindingEventId : undefined
+            }
+        });
+        expect(submitToTopic).toHaveBeenCalledTimes(1);
+        expect(provisionAccountForEvmAlias).toHaveBeenCalledTimes(1);
+    });
+
+    it('coalesces concurrent same-identity and same-key requests into one receipt', async () => {
+        let releaseAlias: (value: { status: 'absent' }) => void = () => undefined;
+        (reconcileEvmAlias as jest.Mock).mockReturnValueOnce(new Promise(resolve => { releaseAlias = resolve; }));
+
+        const first = IdentityRegistrationService.register(request);
+        const duplicate = IdentityRegistrationService.register(request);
+        releaseAlias({ status: 'absent' });
+        const [a, b] = await Promise.all([first, duplicate]);
+
+        expect(a).toEqual(b);
+        expect(submitToTopic).toHaveBeenCalledTimes(1);
+        expect(provisionAccountForEvmAlias).toHaveBeenCalledTimes(1);
+    });
+
+    it('reconciles an uncertain provision before a later provision retry', async () => {
+        (provisionAccountForEvmAlias as jest.Mock)
+            .mockRejectedValueOnce(new Error('provider timeout'))
+            .mockResolvedValueOnce({ hederaAccountId: '0.0.701', transactionId: 'provider-retry' });
+        (reconcileEvmAlias as jest.Mock)
+            .mockResolvedValueOnce({ status: 'absent' })
+            .mockResolvedValueOnce({ status: 'absent' })
+            .mockResolvedValueOnce({ status: 'absent' });
+
+        const first = await IdentityRegistrationService.register(request);
+        expect(first).toMatchObject({ status: 'pending', reason: 'PROVIDER_OUTCOME_UNCERTAIN', retryable: true });
+        expect(topicHistory).toHaveLength(0);
+
+        const retry = await IdentityRegistrationService.register({ ...request, idempotencyKey: 'registration-retry' });
+        expect(retry).toMatchObject({ status: 'bound', resolutionSource: 'provider-provisioned' });
+        expect(provisionAccountForEvmAlias).toHaveBeenCalledTimes(2);
+        expect(fetchMirrorTopicMessagesJson).toHaveBeenCalledTimes(6);
+    });
+
+    it('reconciles an uncertain HCS submit and returns its observed current receipt', async () => {
+        (submitToTopic as jest.Mock).mockImplementationOnce(async (_topic: string, message: string) => {
+            pushTopicEvent(JSON.parse(message));
+            throw new Error('submit response lost');
+        });
+
+        const result = await IdentityRegistrationService.register(request);
+
+        expect(result).toMatchObject({
+            status: 'bound',
+            resolutionSource: 'currentness-reconciled',
+            bindingEventReceipt: { bindingEventId: '0.0.999:1', transactionId: null }
+        });
+        expect(submitToTopic).toHaveBeenCalledTimes(1);
+        expect(provisionAccountForEvmAlias).toHaveBeenCalledTimes(1);
+    });
+
+    it('fails closed when the configured binding authority does not match the operator signer', async () => {
+        config.BINDING_EVIDENCE_AUTHORITY_PUBLIC_KEY = new SigningKey(OTHER_PRIVATE_KEY).publicKey;
+
+        const result = await IdentityRegistrationService.register(request);
+
+        expect(result).toMatchObject({ status: 'blocked', reason: 'AUTHORITY_SIGNER_MISMATCH' });
+        expect(fetchMirrorTopicMessagesJson).not.toHaveBeenCalled();
+        expect(provisionAccountForEvmAlias).not.toHaveBeenCalled();
+        expect(submitToTopic).not.toHaveBeenCalled();
+    });
+
+    it('fails closed when binding evidence authority configuration is incomplete', async () => {
+        config.BINDING_EVIDENCE_AUTHORITY_KEY_ID = undefined;
+
+        const result = await IdentityRegistrationService.register(request);
+
+        expect(result).toMatchObject({ status: 'blocked', reason: 'INVALID_AUTHORITY_CONFIGURATION' });
+        expect(fetchMirrorTopicMessagesJson).not.toHaveBeenCalled();
+        expect(submitToTopic).not.toHaveBeenCalled();
+    });
+
+    it('derives EIP-191 signing material from the actual ECDSA operator key', () => {
+        const actualClient = jest.requireActual('../hedera/client') as typeof import('../hedera/client');
+        const signer = actualClient.getHederaOperatorEvidenceSigner();
+        const signature = signer.signMessage('registration signer check');
+
+        expect(signer.accountId).toBe('0.0.600');
+        expect(verifyMessage('registration signer check', signature)).toBe(computeAddress(signer.publicKey));
+        expect(signer.publicKey).toBe(bindingSigningKey.publicKey);
+    });
+
+    it('does not treat unsigned legacy evidence as current or proceed to provision', async () => {
+        const unsigned = signedEvidence();
+        delete (unsigned as Partial<IdentityRegistrationBindingEnvelopeV1>).provenance;
+        pushTopicEvent(unsigned);
+
+        const currentness = await CurrentnessService.read({ requestVersion: 'v1', identity });
+        expect(currentness.disposition).toBe('UNKNOWN_STALE');
+
+        const result = await IdentityRegistrationService.register(request);
+        expect(result).toMatchObject({ status: 'blocked', reason: 'CURRENTNESS_NOT_CURRENT' });
+        expect(reconcileEvmAlias).not.toHaveBeenCalled();
+        expect(provisionAccountForEvmAlias).not.toHaveBeenCalled();
+    });
+
+    it('requires the existing Worlds Builder service token on registration', async () => {
+        const app = createApp();
+        const server = app.listen(0);
+        const address = server.address();
+        if (!address || typeof address === 'string') throw new Error('Test server did not bind.');
+
+        try {
+            const response = await fetch(`http://127.0.0.1:${address.port}/v1/identity-binding/register`, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify(request)
+            });
+            const body = await response.json() as { status: string; reason: string };
+
+            expect(response.status).toBe(401);
+            expect(body).toMatchObject({ status: 'blocked', reason: 'AUTHENTICATION_FAILURE' });
+            expect(fetchMirrorTopicMessagesJson).not.toHaveBeenCalled();
+        } finally {
+            await new Promise<void>((resolve, reject) => {
+                server.close(error => error ? reject(error) : resolve());
+            });
+        }
+    });
+
+    it('rejects product role and organism assertions from the strict request', async () => {
+        const app = createApp();
+        const server = app.listen(0);
+        const address = server.address();
+        if (!address || typeof address === 'string') throw new Error('Test server did not bind.');
+
+        try {
+            const response = await fetch(`http://127.0.0.1:${address.port}/v1/identity-binding/register`, {
+                method: 'POST',
+                headers: {
+                    'content-type': 'application/json',
+                    'x-worlds-builder-service-token': 'worlds-builder-secret'
+                },
+                body: JSON.stringify({ ...request, requestedRole: 'foundingSteward', organismId: 'world-1' })
+            });
+            const body = await response.json() as { status: string; reason: string };
+
+            expect(response.status).toBe(400);
+            expect(body).toMatchObject({ status: 'blocked', reason: 'INVALID_REQUEST' });
+            expect(fetchMirrorTopicMessagesJson).not.toHaveBeenCalled();
+            expect(provisionAccountForEvmAlias).not.toHaveBeenCalled();
+        } finally {
+            await new Promise<void>((resolve, reject) => {
+                server.close(error => error ? reject(error) : resolve());
+            });
+        }
+    });
+});
