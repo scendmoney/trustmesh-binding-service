@@ -13,8 +13,12 @@ import {
     reconcileEvmAlias,
     submitToTopic
 } from '../hedera/client';
+import { TopicMessageSubmitTransaction } from '@hashgraph/sdk';
 import { computeAddress, hashMessage, SigningKey, verifyMessage } from 'ethers';
-import type { IdentityRegistrationBindingEnvelopeV1 } from './types';
+import type {
+    IdentityRegistrationBindingEnvelopeV1,
+    IdentityRegistrationBlockedReasonV1
+} from './types';
 
 const BINDING_PRIVATE_KEY = `0x${'11'.repeat(32)}`;
 const OTHER_PRIVATE_KEY = `0x${'33'.repeat(32)}`;
@@ -78,12 +82,62 @@ const request = {
 const operationOwnerRef = 'worldsbuilder-0034:claim-operation-01';
 const register = (
     input: typeof request = request,
-    recoveryAuthorized = false,
     ownerRef = operationOwnerRef
-) => IdentityRegistrationService.register(input, {
-    operationOwnerRef: ownerRef,
-    recoveryAuthorized
-});
+) => IdentityRegistrationService.register(input, { operationOwnerRef: ownerRef });
+
+const sensitiveSentinels = [
+    'did:magic:sentinel:canonical-subject',
+    '0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef',
+    'consent:sentinel:receipt-secret',
+    'credential-sentinel-super-secret'
+] as const;
+
+const expectNoSensitiveSentinels = (value: unknown): void => {
+    const serialized = JSON.stringify(value);
+    for (const sentinel of sensitiveSentinels) expect(serialized).not.toContain(sentinel);
+};
+
+const strictBlockedKeys = ['message', 'reason', 'responseVersion', 'retryable', 'status'];
+
+const expectStrictBlockedEnvelope = (
+    body: Record<string, unknown>,
+    reason: IdentityRegistrationBlockedReasonV1
+): void => {
+    expect(Object.keys(body).sort()).toEqual(strictBlockedKeys);
+    expect(body).toMatchObject({
+        responseVersion: 'v1',
+        status: 'blocked',
+        reason,
+        retryable: false,
+        message: expect.any(String)
+    });
+};
+
+const postRegistration = async (
+    body: unknown = request,
+    headers: Record<string, string> = {}
+): Promise<{ status: number; body: Record<string, unknown> }> => {
+    const app = createApp();
+    const server = app.listen(0);
+    const address = server.address();
+    if (!address || typeof address === 'string') throw new Error('Test server did not bind.');
+
+    try {
+        const response = await fetch(`http://127.0.0.1:${address.port}/v1/identity-binding/register`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', ...headers },
+            body: JSON.stringify(body)
+        });
+        return {
+            status: response.status,
+            body: await response.json() as Record<string, unknown>
+        };
+    } finally {
+        await new Promise<void>((resolve, reject) => {
+            server.close(error => error ? reject(error) : resolve());
+        });
+    }
+};
 
 type TopicMessage = {
     consensus_timestamp: string;
@@ -191,6 +245,10 @@ beforeEach(() => {
     config.BINDING_EVIDENCE_AUTHORITY_KEY_ID = 'binding-key-v1';
     config.BINDING_EVIDENCE_AUTHORITY_PUBLIC_KEY = bindingSigningKey.publicKey;
     config.BINDING_EVIDENCE_AUTHORIZATION_BASIS = 'strategy-ruling-eugene-t1';
+    config.HEDERA_NETWORK = 'testnet';
+    config.HEDERA_OPERATOR_ID = '0.0.600';
+    config.HEDERA_OPERATOR_KEY = BINDING_PRIVATE_KEY;
+    config.WORLDS_BUILDER_SERVICE_TOKEN = 'worlds-builder-secret';
 });
 
 describe('IdentityRegistrationService', () => {
@@ -369,12 +427,10 @@ describe('IdentityRegistrationService', () => {
         expect(provisionAccountForEvmAlias).toHaveBeenCalledTimes(1);
     });
 
-    it('requires owner-authorized currentness reconciliation after an uncertain provision', async () => {
+    it('keeps registration blocked after an uncertain provision and permits currentness-only follow-up', async () => {
         (provisionAccountForEvmAlias as jest.Mock)
-            .mockRejectedValueOnce(new Error('provider timeout'))
-            .mockResolvedValueOnce({ hederaAccountId: '0.0.701', transactionId: 'provider-retry' });
+            .mockRejectedValueOnce(new Error('provider timeout'));
         (reconcileEvmAlias as jest.Mock)
-            .mockResolvedValueOnce({ status: 'absent' })
             .mockResolvedValueOnce({ status: 'absent' })
             .mockResolvedValueOnce({ status: 'absent' });
 
@@ -385,23 +441,23 @@ describe('IdentityRegistrationService', () => {
         const exactRetry = await register();
         expect(exactRetry).toEqual(first);
 
-        const unauthorizedRetry = await register({ ...request, idempotencyKey: 'registration-retry' });
-        expect(unauthorizedRetry).toMatchObject({
+        const newRegistration = await register({ ...request, idempotencyKey: 'registration-retry' });
+        expect(newRegistration).toMatchObject({
             status: 'blocked',
-            reason: 'RECOVERY_AUTHORITY_REQUIRED'
+            reason: 'UNCERTAIN_OUTCOME_BLOCKED'
         });
         expect(provisionAccountForEvmAlias).toHaveBeenCalledTimes(1);
 
         const reconciled = await CurrentnessService.read({ requestVersion: 'v1', identity });
         expect(reconciled.disposition).toBe('UNBOUND');
 
-        const recovered = await register(
-            { ...request, idempotencyKey: 'registration-recovery' },
-            true
-        );
-        expect(recovered).toMatchObject({ status: 'bound', resolutionSource: 'provider-provisioned' });
-        expect(provisionAccountForEvmAlias).toHaveBeenCalledTimes(2);
-        expect(fetchMirrorTopicMessagesJson).toHaveBeenCalledTimes(8);
+        const afterCurrentness = await register({ ...request, idempotencyKey: 'registration-after-currentness' });
+        expect(afterCurrentness).toMatchObject({
+            status: 'blocked',
+            reason: 'UNCERTAIN_OUTCOME_BLOCKED'
+        });
+        expect(provisionAccountForEvmAlias).toHaveBeenCalledTimes(1);
+        expect(fetchMirrorTopicMessagesJson).toHaveBeenCalledTimes(6);
     });
 
     it('reconciles an uncertain HCS submit and returns its observed current receipt', async () => {
@@ -453,29 +509,51 @@ describe('IdentityRegistrationService', () => {
     });
 
     it('scrubs identity values from the exceptional EVM lookup warning', async () => {
-        const leakedError = new TypeError(
-            `lookup failed for ${request.evmPublicAddress} ${identity.canonicalDid} ${identity.stableIdentifier} ${identity.issuer}`
-        );
+        const leakedError = new TypeError(`lookup failed for ${sensitiveSentinels.join(' ')}`);
         const fetchSpy = jest.spyOn(global, 'fetch').mockRejectedValue(leakedError);
 
         try {
             const actualClient = jest.requireActual('../hedera/client') as typeof import('../hedera/client');
-            await expect(actualClient.lookupAccountByEvm(request.evmPublicAddress)).resolves.toBeNull();
+            await expect(actualClient.lookupAccountByEvm(sensitiveSentinels[1])).resolves.toBeNull();
 
             expect(log.warn).toHaveBeenCalledWith('Mirror EVM account lookup failed', {
                 classification: 'MIRROR_NETWORK_ERROR'
             });
-            const warning = JSON.stringify((log.warn as jest.Mock).mock.calls);
-            for (const identityValue of [
-                request.evmPublicAddress,
-                identity.canonicalDid,
-                identity.stableIdentifier,
-                identity.issuer
-            ]) {
-                expect(warning).not.toContain(identityValue);
-            }
+            expectNoSensitiveSentinels((log.warn as jest.Mock).mock.calls);
         } finally {
             fetchSpy.mockRestore();
+        }
+    });
+
+    it('logs only a bounded classification for Hedera initialization failures', () => {
+        const actualClient = jest.requireActual('../hedera/client') as typeof import('../hedera/client');
+        config.HEDERA_OPERATOR_KEY = sensitiveSentinels.join('|');
+
+        expect(() => actualClient.getHederaClient()).toThrow();
+        expect(log.error).toHaveBeenCalledWith('Failed to initialize Hedera client', undefined, {
+            classification: 'HEDERA_INITIALIZATION_ERROR'
+        });
+        expectNoSensitiveSentinels((log.error as jest.Mock).mock.calls);
+    });
+
+    it('logs only a bounded classification for Hedera submission failures', async () => {
+        const actualClient = jest.requireActual('../hedera/client') as typeof import('../hedera/client');
+        const hederaClient = actualClient.getHederaClient();
+        const executeSpy = jest.spyOn(TopicMessageSubmitTransaction.prototype, 'execute')
+            .mockRejectedValue(new Error(`submission failed for ${sensitiveSentinels.join(' ')}`));
+
+        try {
+            await expect(actualClient.submitToTopic(
+                config.IDENTITY_TOPIC_ID,
+                JSON.stringify({ sensitiveSentinels })
+            )).rejects.toThrow();
+            expect(log.error).toHaveBeenCalledWith('Failed to submit to topic', undefined, {
+                classification: 'HEDERA_SUBMISSION_ERROR'
+            });
+            expectNoSensitiveSentinels((log.error as jest.Mock).mock.calls);
+        } finally {
+            executeSpy.mockRestore();
+            await hederaClient.close();
         }
     });
 
@@ -493,114 +571,68 @@ describe('IdentityRegistrationService', () => {
         expect(provisionAccountForEvmAlias).not.toHaveBeenCalled();
     });
 
-    it('requires the existing Worlds Builder service token on registration', async () => {
-        const app = createApp();
-        const server = app.listen(0);
-        const address = server.address();
-        if (!address || typeof address === 'string') throw new Error('Test server did not bind.');
+    it('returns a strict v1 failure when registration authentication is unavailable', async () => {
+        config.WORLDS_BUILDER_SERVICE_TOKEN = undefined;
 
-        try {
-            const response = await fetch(`http://127.0.0.1:${address.port}/v1/identity-binding/register`, {
-                method: 'POST',
-                headers: { 'content-type': 'application/json' },
-                body: JSON.stringify(request)
-            });
-            const body = await response.json() as { status: string; reason: string };
+        const response = await postRegistration();
 
-            expect(response.status).toBe(401);
-            expect(body).toMatchObject({ status: 'blocked', reason: 'AUTHENTICATION_FAILURE' });
-            expect(fetchMirrorTopicMessagesJson).not.toHaveBeenCalled();
-        } finally {
-            await new Promise<void>((resolve, reject) => {
-                server.close(error => error ? reject(error) : resolve());
-            });
-        }
+        expect(response.status).toBe(503);
+        expectStrictBlockedEnvelope(response.body, 'SERVICE_AUTHENTICATION_UNAVAILABLE');
+        expect(fetchMirrorTopicMessagesJson).not.toHaveBeenCalled();
     });
 
-    it('requires a durable upstream operation-owner reference on the protected route', async () => {
-        const app = createApp();
-        const server = app.listen(0);
-        const address = server.address();
-        if (!address || typeof address === 'string') throw new Error('Test server did not bind.');
+    it('returns a strict v1 failure for an invalid Worlds Builder service token', async () => {
+        const response = await postRegistration(request, {
+            'x-worlds-builder-service-token': 'wrong-token'
+        });
 
-        try {
-            const response = await fetch(`http://127.0.0.1:${address.port}/v1/identity-binding/register`, {
-                method: 'POST',
-                headers: {
-                    'content-type': 'application/json',
-                    'x-worlds-builder-service-token': 'worlds-builder-secret'
-                },
-                body: JSON.stringify(request)
-            });
-            const body = await response.json() as { status: string; reason: string };
-
-            expect(response.status).toBe(428);
-            expect(body).toMatchObject({ status: 'blocked', reason: 'OPERATION_OWNER_REQUIRED' });
-            expect(fetchMirrorTopicMessagesJson).not.toHaveBeenCalled();
-            expect(provisionAccountForEvmAlias).not.toHaveBeenCalled();
-        } finally {
-            await new Promise<void>((resolve, reject) => {
-                server.close(error => error ? reject(error) : resolve());
-            });
-        }
+        expect(response.status).toBe(401);
+        expectStrictBlockedEnvelope(response.body, 'AUTHENTICATION_FAILURE');
+        expect(fetchMirrorTopicMessagesJson).not.toHaveBeenCalled();
     });
 
-    it('rejects an unrecognized recovery-authority assertion', async () => {
-        const app = createApp();
-        const server = app.listen(0);
-        const address = server.address();
-        if (!address || typeof address === 'string') throw new Error('Test server did not bind.');
+    it('returns a strict v1 failure when the durable operation owner is absent', async () => {
+        const response = await postRegistration(request, {
+            'x-worlds-builder-service-token': 'worlds-builder-secret'
+        });
 
-        try {
-            const response = await fetch(`http://127.0.0.1:${address.port}/v1/identity-binding/register`, {
-                method: 'POST',
-                headers: {
-                    'content-type': 'application/json',
-                    'x-worlds-builder-service-token': 'worlds-builder-secret',
-                    'x-trustmesh-operation-owner': operationOwnerRef,
-                    'x-trustmesh-recovery-authority': 'retry-requested'
-                },
-                body: JSON.stringify(request)
-            });
-            const body = await response.json() as { status: string; reason: string };
-
-            expect(response.status).toBe(400);
-            expect(body).toMatchObject({ status: 'blocked', reason: 'INVALID_RECOVERY_AUTHORITY' });
-            expect(fetchMirrorTopicMessagesJson).not.toHaveBeenCalled();
-            expect(provisionAccountForEvmAlias).not.toHaveBeenCalled();
-        } finally {
-            await new Promise<void>((resolve, reject) => {
-                server.close(error => error ? reject(error) : resolve());
-            });
-        }
+        expect(response.status).toBe(428);
+        expectStrictBlockedEnvelope(response.body, 'OPERATION_OWNER_REQUIRED');
+        expect(fetchMirrorTopicMessagesJson).not.toHaveBeenCalled();
+        expect(provisionAccountForEvmAlias).not.toHaveBeenCalled();
     });
 
-    it('rejects product role and organism assertions from the strict request', async () => {
-        const app = createApp();
-        const server = app.listen(0);
-        const address = server.address();
-        if (!address || typeof address === 'string') throw new Error('Test server did not bind.');
+    it('returns a strict v1 failure for invalid request fields without validation details', async () => {
+        const response = await postRegistration(
+            { ...request, requestedRole: 'foundingSteward', organismId: 'world-1' },
+            {
+                'x-worlds-builder-service-token': 'worlds-builder-secret',
+                'x-trustmesh-operation-owner': operationOwnerRef
+            }
+        );
 
+        expect(response.status).toBe(400);
+        expectStrictBlockedEnvelope(response.body, 'INVALID_REQUEST');
+        expect(response.body).not.toHaveProperty('details');
+        expect(fetchMirrorTopicMessagesJson).not.toHaveBeenCalled();
+        expect(provisionAccountForEvmAlias).not.toHaveBeenCalled();
+    });
+
+    it('returns a strict v1 failure for an internal registration failure', async () => {
+        const sentinel = sensitiveSentinels.join(' ');
+        const registerSpy = jest.spyOn(IdentityRegistrationService, 'register')
+            .mockRejectedValueOnce(new Error(sentinel));
         try {
-            const response = await fetch(`http://127.0.0.1:${address.port}/v1/identity-binding/register`, {
-                method: 'POST',
-                headers: {
-                    'content-type': 'application/json',
-                    'x-worlds-builder-service-token': 'worlds-builder-secret',
-                    'x-trustmesh-operation-owner': operationOwnerRef
-                },
-                body: JSON.stringify({ ...request, requestedRole: 'foundingSteward', organismId: 'world-1' })
+            const response = await postRegistration(request, {
+                'x-worlds-builder-service-token': 'worlds-builder-secret',
+                'x-trustmesh-operation-owner': operationOwnerRef
             });
-            const body = await response.json() as { status: string; reason: string };
 
-            expect(response.status).toBe(400);
-            expect(body).toMatchObject({ status: 'blocked', reason: 'INVALID_REQUEST' });
-            expect(fetchMirrorTopicMessagesJson).not.toHaveBeenCalled();
-            expect(provisionAccountForEvmAlias).not.toHaveBeenCalled();
+            expect(response.status).toBe(500);
+            expectStrictBlockedEnvelope(response.body, 'INTERNAL_FAILURE');
+            expectNoSensitiveSentinels(response.body);
         } finally {
-            await new Promise<void>((resolve, reject) => {
-                server.close(error => error ? reject(error) : resolve());
-            });
+            registerSpy.mockRestore();
         }
     });
 });

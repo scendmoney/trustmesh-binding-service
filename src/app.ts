@@ -8,11 +8,23 @@ import { ResolveService } from './services/binding/resolveService';
 import { BindingService } from './services/binding/bindingService';
 import { FounderBindingService } from './services/binding/founderBindingService';
 import { CurrentnessReadError, CurrentnessService } from './services/binding/currentnessService';
-import {
-    IDENTITY_REGISTRATION_RECOVERY_AUTHORITY,
-    IdentityRegistrationService
-} from './services/binding/identityRegistrationService';
+import { IdentityRegistrationService } from './services/binding/identityRegistrationService';
+import type {
+    IdentityRegistrationBlockedReasonV1,
+    IdentityRegistrationBlockedResponseV1
+} from './services/binding/types';
 import { z } from 'zod';
+
+const identityRegistrationBlocked = (
+    reason: IdentityRegistrationBlockedReasonV1,
+    message: string
+): IdentityRegistrationBlockedResponseV1 => ({
+    responseVersion: 'v1',
+    status: 'blocked',
+    reason,
+    retryable: false,
+    message
+});
 
 export const createApp = () => {
     const app = express();
@@ -32,6 +44,11 @@ export const createApp = () => {
         windowMs: 60 * 1000,
         limit: 10,
         message: 'Too many binding attempts'
+    });
+    const identityRegistrationLimiter = rateLimit({
+        windowMs: 60 * 1000,
+        limit: 10,
+        message: identityRegistrationBlocked('RATE_LIMITED', 'Too many identity registration attempts.')
     });
 
     // Validation Schemas
@@ -198,47 +215,27 @@ export const createApp = () => {
         }
     });
 
-    app.post('/v1/identity-binding/register', writeLimiter, async (req, res) => {
+    app.post('/v1/identity-binding/register', identityRegistrationLimiter, async (req, res) => {
         if (!config.WORLDS_BUILDER_SERVICE_TOKEN) {
-            res.status(503).json({
-                responseVersion: 'v1',
-                status: 'blocked',
-                reason: 'SERVICE_AUTHENTICATION_UNAVAILABLE',
-                retryable: false,
-                message: 'Identity registration authentication is not configured.'
-            });
+            res.status(503).json(identityRegistrationBlocked(
+                'SERVICE_AUTHENTICATION_UNAVAILABLE',
+                'Identity registration authentication is not configured.'
+            ));
             return;
         }
         if (req.header('x-worlds-builder-service-token') !== config.WORLDS_BUILDER_SERVICE_TOKEN) {
-            res.status(401).json({
-                responseVersion: 'v1',
-                status: 'blocked',
-                reason: 'AUTHENTICATION_FAILURE',
-                retryable: false,
-                message: 'Missing or invalid Worlds Builder service token.'
-            });
+            res.status(401).json(identityRegistrationBlocked(
+                'AUTHENTICATION_FAILURE',
+                'Missing or invalid Worlds Builder service token.'
+            ));
             return;
         }
 
         const operationOwnerRef = req.header('x-trustmesh-operation-owner') ?? '';
-        const recoveryAuthority = req.header('x-trustmesh-recovery-authority');
-        if (recoveryAuthority && recoveryAuthority !== IDENTITY_REGISTRATION_RECOVERY_AUTHORITY) {
-            res.status(400).json({
-                responseVersion: 'v1',
-                status: 'blocked',
-                reason: 'INVALID_RECOVERY_AUTHORITY',
-                retryable: false,
-                message: 'Identity registration recovery authority is invalid.'
-            });
-            return;
-        }
 
         try {
             const body = identityRegistrationSchema.parse(req.body);
-            const result = await IdentityRegistrationService.register(body, {
-                operationOwnerRef,
-                recoveryAuthorized: recoveryAuthority === IDENTITY_REGISTRATION_RECOVERY_AUTHORITY
-            });
+            const result = await IdentityRegistrationService.register(body, { operationOwnerRef });
             const status = result.status === 'bound'
                 ? 200
                 : result.status === 'pending'
@@ -247,32 +244,25 @@ export const createApp = () => {
                         ? 428
                     : result.reason === 'IDENTITY_CONFLICT' ||
                         result.reason === 'IDEMPOTENCY_KEY_REUSE' ||
-                        result.reason === 'RECOVERY_AUTHORITY_REQUIRED' ||
+                        result.reason === 'UNCERTAIN_OUTCOME_BLOCKED' ||
                         result.reason === 'CURRENTNESS_NOT_CURRENT'
                         ? 409
                         : 503;
             res.status(status).json(result);
         } catch (error) {
             if (error instanceof z.ZodError) {
-                res.status(400).json({
-                    responseVersion: 'v1',
-                    status: 'blocked',
-                    reason: 'INVALID_REQUEST',
-                    retryable: false,
-                    message: 'Invalid identity registration request.',
-                    details: error.errors
-                });
+                res.status(400).json(identityRegistrationBlocked(
+                    'INVALID_REQUEST',
+                    'Invalid identity registration request.'
+                ));
                 return;
             }
 
             log.error('Identity registration route failed');
-            res.status(500).json({
-                responseVersion: 'v1',
-                status: 'blocked',
-                reason: 'INTERNAL_FAILURE',
-                retryable: false,
-                message: 'Identity registration failed closed.'
-            });
+            res.status(500).json(identityRegistrationBlocked(
+                'INTERNAL_FAILURE',
+                'Identity registration failed closed.'
+            ));
         }
     });
 

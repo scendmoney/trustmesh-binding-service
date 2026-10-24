@@ -26,11 +26,9 @@ const SERVICE_VERSION = packageJson.version;
 const IDENTITY_PURPOSE = 'eugene.business.admin.custody' as const;
 export const IDENTITY_REGISTRATION_COMPLETED_OUTCOME_TTL_MS = 15 * 60 * 1000;
 export const IDENTITY_REGISTRATION_MAX_TRACKED_OPERATIONS = 1000;
-export const IDENTITY_REGISTRATION_RECOVERY_AUTHORITY = 'currentness-reconciled';
 
 export interface IdentityRegistrationInvocation {
     operationOwnerRef: string;
-    recoveryAuthorized: boolean;
 }
 
 interface CompletedOutcomeEntry {
@@ -423,43 +421,27 @@ const inFlightIdempotency = new Map<string, {
     operation: Promise<IdentityRegistrationResponseV1>;
 }>();
 const completedOutcomes = new IdentityRegistrationCompletedOutcomeCache();
-const pendingRecoveryGuards = new Map<string, {
-    operationOwnerRef: string;
-    expiresAt: number;
-}>();
+const uncertainIdentityBlocks = new Set<string>();
+let uncertainIdentityBlockCapacityReached = false;
 
-const cleanupPendingRecoveryGuards = (at = Date.now()): void => {
-    for (const [key, guard] of pendingRecoveryGuards) {
-        if (at >= guard.expiresAt) pendingRecoveryGuards.delete(key);
-    }
-};
-
-const performProtectedRegistration = async (
-    input: IdentityRegistrationRequestV1,
-    invocation: IdentityRegistrationInvocation
+const performGuardedRegistration = async (
+    input: IdentityRegistrationRequestV1
 ): Promise<IdentityRegistrationResponseV1> => {
-    cleanupPendingRecoveryGuards();
     const identityKey = identityKeyFor(input);
-    const recoveryGuard = pendingRecoveryGuards.get(identityKey);
-    if (recoveryGuard) {
-        if (
-            !invocation.recoveryAuthorized ||
-            recoveryGuard.operationOwnerRef !== invocation.operationOwnerRef
-        ) {
-            return blocked(
-                'RECOVERY_AUTHORITY_REQUIRED',
-                'A prior uncertain registration requires owner-authorized currentness reconciliation before recovery.'
-            );
-        }
-        pendingRecoveryGuards.delete(identityKey);
+    if (uncertainIdentityBlockCapacityReached || uncertainIdentityBlocks.has(identityKey)) {
+        return blocked(
+            'UNCERTAIN_OUTCOME_BLOCKED',
+            'A prior uncertain outcome blocks further registration; use nonmutating currentness reads only.'
+        );
     }
 
     const response = await performRegistration(input);
     if (response.status === 'pending') {
-        pendingRecoveryGuards.set(identityKey, {
-            operationOwnerRef: invocation.operationOwnerRef,
-            expiresAt: Date.now() + IDENTITY_REGISTRATION_COMPLETED_OUTCOME_TTL_MS
-        });
+        if (uncertainIdentityBlocks.size < IDENTITY_REGISTRATION_MAX_TRACKED_OPERATIONS) {
+            uncertainIdentityBlocks.add(identityKey);
+        } else {
+            uncertainIdentityBlockCapacityReached = true;
+        }
     }
     return response;
 };
@@ -508,8 +490,7 @@ export class IdentityRegistrationService {
             input.purpose,
             input.consentReceiptRef,
             input.requestedAt,
-            invocation.operationOwnerRef,
-            invocation.recoveryAuthorized
+            invocation.operationOwnerRef
         ]);
 
         const completed = completedOutcomes.lookup(input.idempotencyKey, fingerprint);
@@ -534,7 +515,7 @@ export class IdentityRegistrationService {
         }
 
         let operation: Promise<IdentityRegistrationResponseV1>;
-        operation = serializeByIdentity(input, () => performProtectedRegistration(input, invocation))
+        operation = serializeByIdentity(input, () => performGuardedRegistration(input))
             .catch(() => blocked('CURRENTNESS_UNAVAILABLE', 'Identity registration failed closed.'))
             .then(response => {
                 completedOutcomes.store(input.idempotencyKey, fingerprint, response);
@@ -556,6 +537,7 @@ export class IdentityRegistrationService {
         identityLocks.clear();
         inFlightIdempotency.clear();
         completedOutcomes.clear();
-        pendingRecoveryGuards.clear();
+        uncertainIdentityBlocks.clear();
+        uncertainIdentityBlockCapacityReached = false;
     }
 }

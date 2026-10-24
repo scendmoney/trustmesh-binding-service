@@ -132,23 +132,22 @@ the exact DID, stable identifier, and issuer and carry signed
 must match the actual Hedera operator account and signing key. Ambiguous,
 revoked, superseded, stale, unsigned, or unverifiable evidence blocks
 registration. Uncertain provider or HCS outcomes return `pending`; they require
-a fresh reconciliation before any recovery. A caller must treat `pending` as
-terminal for that operation, persist it, and perform a separate nonmutating
-currentness read. It must not invoke registration again merely as a retry. If
-currentness remains unbound and the durable operation owner grants explicit
-recovery authority, recovery uses a new idempotency key, the same
-`x-trustmesh-operation-owner`, and
-`x-trustmesh-recovery-authority: currentness-reconciled`. The service blocks a
-same-process post-pending attempt without that authority; this is a guardrail,
-not the durable operation record.
+a fresh nonmutating currentness read. A caller must treat `pending` as terminal
+for registration, persist it, and must not invoke registration again with a new
+key. The service blocks further registration for that identity for the
+remaining process lifetime; routine follow-up is currentness-only. There is no
+reprovision or recovery capability in this contract. Any future recovery path
+requires a separately designed, separately authenticated, and admin-authorized
+contract and is not implemented here.
 
 Completed idempotency outcomes are retained in process for 15 minutes, with a
 maximum of 1,000 tracked operations. During that window, an exact same-key
 retry returns the same response and changed input with the same key is blocked.
 Capacity is reserved for in-flight operations, so a full registry starts no
 new provider work. This cache is deliberately process-local: it provides no
-cross-instance or restart durability, and the upstream operation owner must
-enforce the recovery rule across those boundaries.
+cross-instance or restart durability. WorldsBuilder's durable operation owner
+must prevent further registration after an uncertain outcome across those
+boundaries and keep follow-up currentness-only.
 
 A `bound` result identifies the exact identity, EVM address, Hedera account,
 binding event receipt, resolution source, service version, and bound time. It

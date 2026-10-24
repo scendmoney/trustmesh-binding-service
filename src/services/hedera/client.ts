@@ -286,15 +286,39 @@ export const fetchMirrorTopicMessagesJson = async <T>(
     return fetchMirrorUrlJson<T>(url, options);
 };
 
+export type HederaFailureClassification =
+    | 'HEDERA_INITIALIZATION_ERROR'
+    | 'HEDERA_SUBMISSION_ERROR'
+    | 'HEDERA_NETWORK_ERROR'
+    | 'HEDERA_TIMEOUT';
+
+export const classifyHederaFailure = (
+    error: unknown,
+    phase: 'initialization' | 'submission'
+): HederaFailureClassification => {
+    if (error instanceof Error && error.name === 'AbortError') return 'HEDERA_TIMEOUT';
+    if (phase === 'submission' && error instanceof TypeError) return 'HEDERA_NETWORK_ERROR';
+    return phase === 'initialization' ? 'HEDERA_INITIALIZATION_ERROR' : 'HEDERA_SUBMISSION_ERROR';
+};
+
 export const getHederaClient = (): Client => {
     if (client) return client;
 
+    let initializedClient: Client | null = null;
     try {
-        client = Client.forName(config.HEDERA_NETWORK);
-        client.setOperator(config.HEDERA_OPERATOR_ID, parseOperatorKey(config.HEDERA_OPERATOR_KEY));
-        return client;
+        initializedClient = Client.forName(config.HEDERA_NETWORK);
+        initializedClient.setOperator(config.HEDERA_OPERATOR_ID, parseOperatorKey(config.HEDERA_OPERATOR_KEY));
+        client = initializedClient;
+        return initializedClient;
     } catch (error) {
-        log.error('Failed to initialize Hedera client', error);
+        try {
+            initializedClient?.close();
+        } catch {
+            // Initialization still fails closed if local client cleanup also fails.
+        }
+        log.error('Failed to initialize Hedera client', undefined, {
+            classification: classifyHederaFailure(error, 'initialization')
+        });
         throw error;
     }
 };
@@ -319,7 +343,9 @@ export const submitToTopic = async (topicId: string, message: string) => {
             consensusTimestamp: tx.transactionId.validStart?.toString?.() ?? null,
         };
     } catch (error) {
-        log.error('Failed to submit to topic', error, { topicId });
+        log.error('Failed to submit to topic', undefined, {
+            classification: classifyHederaFailure(error, 'submission')
+        });
         throw error;
     }
 };
