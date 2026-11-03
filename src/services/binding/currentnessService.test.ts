@@ -762,3 +762,96 @@ describe('POST /v1/currentness authentication', () => {
         }
     });
 });
+
+describe('Currentness rate-limit client identity', () => {
+    afterEach(() => {
+        jest.restoreAllMocks();
+    });
+
+    const sendUnauthenticatedCurrentness = async (url: string, forwardedFor: string) => {
+        const response = await fetch(url, {
+            method: 'POST',
+            headers: {
+                'content-type': 'application/json',
+                'x-forwarded-for': forwardedFor
+            },
+            body: JSON.stringify(request)
+        });
+        return response.status;
+    };
+
+    it('keeps the authorized service in one bucket across Railway-style forwarding chains', async () => {
+        const rateLimitError = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+        const app = createApp();
+        expect(app.get('trust proxy')).toBe(false);
+
+        const server = app.listen(0);
+        const address = server.address();
+        if (!address || typeof address === 'string') throw new Error('Test server did not bind.');
+
+        try {
+            const url = `http://127.0.0.1:${address.port}/v1/currentness`;
+            for (let attempt = 0; attempt < 60; attempt += 1) {
+                const response = await fetch(url, {
+                    method: 'POST',
+                    headers: {
+                        'content-type': 'application/json',
+                        'x-forwarded-for': `203.0.113.${attempt + 1}, 198.51.100.41`,
+                        'x-trustmesh-currentness-token': 'reader-secret'
+                    },
+                    body: JSON.stringify({})
+                });
+                expect(response.status).toBe(400);
+            }
+
+            const limited = await fetch(url, {
+                method: 'POST',
+                headers: {
+                    'content-type': 'application/json',
+                    'x-forwarded-for': '192.0.2.77, 198.51.100.42',
+                    'x-trustmesh-currentness-token': 'reader-secret'
+                },
+                body: JSON.stringify({})
+            });
+            expect(limited.status).toBe(429);
+            expect(rateLimitError).not.toHaveBeenCalled();
+        } finally {
+            await new Promise<void>((resolve, reject) => {
+                server.close(error => error ? reject(error) : resolve());
+            });
+        }
+    });
+
+    it('ignores forged forwarding on a direct path in a Railway-configured process', async () => {
+        const originalRailwayEnvironmentId = process.env.RAILWAY_ENVIRONMENT_ID;
+        process.env.RAILWAY_ENVIRONMENT_ID = 'test-railway-environment';
+        const rateLimitError = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+        const app = createApp();
+        expect(app.get('trust proxy')).toBe(false);
+
+        const server = app.listen(0);
+        const address = server.address();
+        if (!address || typeof address === 'string') throw new Error('Test server did not bind.');
+
+        try {
+            const url = `http://127.0.0.1:${address.port}/v1/currentness`;
+            for (let attempt = 0; attempt < 60; attempt += 1) {
+                const forgedAddress = `198.51.100.${attempt + 1}`;
+                expect(await sendUnauthenticatedCurrentness(url, forgedAddress)).toBe(401);
+            }
+
+            // A new forged address cannot give the same direct peer a fresh bucket.
+            expect(await sendUnauthenticatedCurrentness(url, '203.0.113.55')).toBe(429);
+            expect(rateLimitError).not.toHaveBeenCalled();
+        } finally {
+            if (originalRailwayEnvironmentId === undefined) {
+                delete process.env.RAILWAY_ENVIRONMENT_ID;
+            } else {
+                process.env.RAILWAY_ENVIRONMENT_ID = originalRailwayEnvironmentId;
+            }
+            await new Promise<void>((resolve, reject) => {
+                server.close(error => error ? reject(error) : resolve());
+            });
+        }
+    });
+});

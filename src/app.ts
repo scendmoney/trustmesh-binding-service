@@ -50,6 +50,21 @@ export const createApp = () => {
         limit: 10,
         message: identityRegistrationBlocked('RATE_LIMITED', 'Too many identity registration attempts.')
     });
+    const currentnessLimiter = rateLimit({
+        windowMs: 60 * 1000,
+        limit: 60,
+        message: 'Too many requests',
+        keyGenerator: req => {
+            const suppliedToken = req.header('x-trustmesh-currentness-token');
+            if (config.CURRENTNESS_SERVICE_TOKEN && suppliedToken === config.CURRENTNESS_SERVICE_TOKEN) {
+                return 'currentness:authorized-service';
+            }
+
+            // Railway private traffic can bypass its public edge. Forwarded headers
+            // therefore cannot establish a trustworthy client address in-process.
+            return `currentness:direct-peer:${req.socket.remoteAddress ?? 'unknown'}`;
+        }
+    });
 
     // Validation Schemas
     const bindSchema = z.object({
@@ -266,7 +281,7 @@ export const createApp = () => {
         }
     });
 
-    app.post('/v1/currentness', generalLimiter, async (req, res) => {
+    app.post('/v1/currentness', currentnessLimiter, async (req, res) => {
         if (!config.CURRENTNESS_SERVICE_TOKEN) {
             res.status(503).json({
                 responseVersion: 'v1',
