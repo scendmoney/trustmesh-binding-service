@@ -241,6 +241,36 @@ const configureTopicReader = (): void => {
     });
 };
 
+const installMirrorOneRequestPerSecondFixture = (keepAliasRateLimited = false) => {
+    const previousFetch = global.fetch;
+    const requests: Array<{ path: string; startedAt: number }> = [];
+    let lastRequestAt: number | undefined;
+    global.fetch = jest.fn(async (input: unknown) => {
+        const url = new URL(String(input));
+        const startedAt = Date.now();
+        requests.push({ path: url.pathname, startedAt });
+
+        if (url.pathname.endsWith('/topics/0.0.999/messages')) {
+            lastRequestAt = startedAt;
+            return new Response(JSON.stringify({ messages: [], links: {} }));
+        }
+        if (url.pathname.includes('/accounts/')) {
+            const rateLimited = keepAliasRateLimited ||
+                (lastRequestAt !== undefined && startedAt - lastRequestAt < 1000);
+            lastRequestAt = startedAt;
+            return rateLimited
+                ? new Response('', { status: 429, headers: { 'retry-after': '1' } })
+                : new Response(JSON.stringify({ account: '0.0.701' }));
+        }
+        return new Response('', { status: 404 });
+    }) as unknown as typeof fetch;
+
+    return {
+        requests,
+        restore: () => { global.fetch = previousFetch; }
+    };
+};
+
 const configureSigner = (privateKey = BINDING_PRIVATE_KEY): void => {
     const signer = new SigningKey(privateKey);
     (getHederaOperatorEvidenceSigner as jest.Mock).mockReturnValue({
@@ -281,6 +311,75 @@ beforeEach(() => {
 });
 
 describe('IdentityRegistrationService', () => {
+    it('recovers the immediate alias lookup after UNBOUND currentness on a shared one-request-per-second Mirror key', async () => {
+        const fixture = installMirrorOneRequestPerSecondFixture();
+        jest.useFakeTimers();
+        const realClient = jest.requireActual('../hedera/client') as typeof import('../hedera/client');
+        (fetchMirrorTopicMessagesJson as jest.Mock).mockImplementation(realClient.fetchMirrorTopicMessagesJson);
+        (reconcileEvmAlias as jest.Mock).mockImplementation(realClient.reconcileEvmAlias);
+
+        const currentnessDispositions: string[] = [];
+        const originalRead = CurrentnessService.read.bind(CurrentnessService);
+        const currentnessSpy = jest.spyOn(CurrentnessService, 'read').mockImplementation(async input => {
+            const response = await originalRead(input);
+            currentnessDispositions.push(response.disposition);
+            return response;
+        });
+
+        try {
+            const pending = register({ ...request, idempotencyKey: 'shared-mirror-rps-recovery' });
+            await jest.runAllTimersAsync();
+            const result = await pending;
+
+            expect(currentnessDispositions).toEqual(['UNBOUND']);
+            expect(result).toMatchObject({ status: 'bound', resolutionSource: 'provider-existing' });
+            expect(fixture.requests.map(({ path }) => path)).toEqual([
+                '/api/v1/topics/0.0.999/messages',
+                `/api/v1/accounts/${request.evmPublicAddress.toLowerCase()}`,
+                `/api/v1/accounts/${request.evmPublicAddress.toLowerCase()}`
+            ]);
+            expect(fixture.requests[1].startedAt - fixture.requests[0].startedAt).toBeLessThan(1000);
+            expect(fixture.requests[2].startedAt - fixture.requests[1].startedAt).toBeGreaterThanOrEqual(1000);
+            expect(submitToTopic).toHaveBeenCalledTimes(1);
+            expect(provisionAccountForEvmAlias).not.toHaveBeenCalled();
+        } finally {
+            currentnessSpy.mockRestore();
+            jest.useRealTimers();
+            fixture.restore();
+        }
+    });
+
+    it('keeps exhausted alias 429 responses pending and performs no provider writes', async () => {
+        const fixture = installMirrorOneRequestPerSecondFixture(true);
+        jest.useFakeTimers();
+        const realClient = jest.requireActual('../hedera/client') as typeof import('../hedera/client');
+        (fetchMirrorTopicMessagesJson as jest.Mock).mockImplementation(realClient.fetchMirrorTopicMessagesJson);
+        (reconcileEvmAlias as jest.Mock).mockImplementation(realClient.reconcileEvmAlias);
+
+        try {
+            const pending = register({ ...request, idempotencyKey: 'shared-mirror-rps-exhausted' });
+            await jest.runAllTimersAsync();
+            const result = await pending;
+
+            expect(result).toMatchObject({
+                status: 'pending',
+                reason: 'PROVIDER_OUTCOME_UNCERTAIN',
+                retryable: true
+            });
+            expect(fixture.requests).toHaveLength(4);
+            expect(fixture.requests.slice(1).map(({ path }) => path)).toEqual([
+                `/api/v1/accounts/${request.evmPublicAddress.toLowerCase()}`,
+                `/api/v1/accounts/${request.evmPublicAddress.toLowerCase()}`,
+                `/api/v1/accounts/${request.evmPublicAddress.toLowerCase()}`
+            ]);
+            expect(provisionAccountForEvmAlias).not.toHaveBeenCalled();
+            expect(submitToTopic).not.toHaveBeenCalled();
+        } finally {
+            jest.useRealTimers();
+            fixture.restore();
+        }
+    });
+
     it('creates a signed generic binding and the receipt reads as fresh CURRENT', async () => {
         const registered = await register();
 

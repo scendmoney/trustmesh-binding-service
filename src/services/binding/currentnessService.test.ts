@@ -401,19 +401,16 @@ describe('CurrentnessService conformance', () => {
         expect(fetchMirrorTopicMessagesJson).toHaveBeenCalledTimes(2);
     });
 
-    it('paces multi-page reads and recovers from a bounded Retry-After 429 with complete coverage', async () => {
+    it('paces multi-page reads at one-second intervals with complete coverage', async () => {
         jest.useFakeTimers();
         const startedAt: number[] = [];
-        (fetchMirrorTopicMessagesJson as jest.Mock).mockImplementation(async (path: string) => {
+        (fetchMirrorTopicMessagesJson as jest.Mock).mockImplementation(async () => {
             startedAt.push(Date.now());
             if (startedAt.length === 1) {
                 return {
                     messages: [mirrorMessage(3, binding('0.0.101')), mirrorMessage(2, { unrelated: true })],
                     links: { next: '/page-2' }
                 };
-            }
-            if (startedAt.length === 2) {
-                throw Object.assign(new Error('rate limited'), { status: 429, retryAfterMs: 1000 });
             }
             return { messages: [mirrorMessage(1, { unrelated: true })], links: {} };
         });
@@ -425,36 +422,23 @@ describe('CurrentnessService conformance', () => {
 
             expect(result.disposition).toBe('CURRENT');
             expect(result.authoritativeWatermark).toMatchObject({ sequenceNumber: 3, coverageComplete: true });
-            expect(startedAt).toHaveLength(3);
+            expect(startedAt).toHaveLength(2);
             expect(startedAt[1] - startedAt[0]).toBeGreaterThanOrEqual(1000);
-            expect(startedAt[2] - startedAt[1]).toBeGreaterThanOrEqual(1000);
         } finally {
             jest.useRealTimers();
         }
     });
 
-    it('classifies exhausted 429 retries as TEMPORARY_OUTAGE and never returns CURRENT', async () => {
-        jest.useFakeTimers();
-        const startedAt: number[] = [];
+    it('classifies a final 429 from the shared Mirror client as TEMPORARY_OUTAGE', async () => {
         (fetchMirrorTopicMessagesJson as jest.Mock).mockImplementation(async () => {
-            startedAt.push(Date.now());
             throw Object.assign(new Error('rate limited'), { status: 429, retryAfterMs: 1000 });
         });
 
-        try {
-            const pending = CurrentnessService.read(request);
-            const failure = expect(pending).rejects.toMatchObject({
-                name: 'CurrentnessReadError',
-                code: 'TEMPORARY_OUTAGE'
-            });
-            await jest.runAllTimersAsync();
-            await failure;
-            expect(startedAt).toHaveLength(3);
-            expect(startedAt[1] - startedAt[0]).toBeGreaterThanOrEqual(1000);
-            expect(startedAt[2] - startedAt[1]).toBeGreaterThanOrEqual(1000);
-        } finally {
-            jest.useRealTimers();
-        }
+        await expect(CurrentnessService.read(request)).rejects.toMatchObject({
+            name: 'CurrentnessReadError',
+            code: 'TEMPORARY_OUTAGE'
+        });
+        expect(fetchMirrorTopicMessagesJson).toHaveBeenCalledTimes(1);
     });
 
     it('deduplicates exact repeated topic sequence messages before coverage and reduction', async () => {

@@ -715,9 +715,6 @@ const classifyReadFailure = (error: unknown): CurrentnessReadError => {
 };
 
 const MIRROR_MIN_REQUEST_INTERVAL_MS = 1000;
-const CURRENTNESS_MAX_429_RETRIES_PER_PAGE = 2;
-const CURRENTNESS_MAX_RETRY_AFTER_MS = 5000;
-const CURRENTNESS_MAX_TOTAL_RETRY_WAIT_MS = 10000;
 
 const delay = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -725,52 +722,21 @@ const createCurrentnessPageReader = (
     fetchOptions: { onResponseBytes: (bytes: number) => void }
 ): ((path: string) => Promise<MirrorMessagePage>) => {
     let lastRequestStartedAt: number | undefined;
-    let totalRetryWaitMs = 0;
 
     return async (path: string): Promise<MirrorMessagePage> => {
-        let retries = 0;
-        while (true) {
-            const now = Date.now();
-            const nextPacedAt = lastRequestStartedAt === undefined
-                ? now
-                : lastRequestStartedAt + MIRROR_MIN_REQUEST_INTERVAL_MS;
-            const pacingWaitMs = Math.max(0, nextPacedAt - now);
-            if (pacingWaitMs > 0) await delay(pacingWaitMs);
-            lastRequestStartedAt = Date.now();
+        const now = Date.now();
+        const nextPacedAt = lastRequestStartedAt === undefined
+            ? now
+            : lastRequestStartedAt + MIRROR_MIN_REQUEST_INTERVAL_MS;
+        const pacingWaitMs = Math.max(0, nextPacedAt - now);
+        if (pacingWaitMs > 0) await delay(pacingWaitMs);
+        lastRequestStartedAt = Date.now();
 
-            try {
-                return await fetchMirrorTopicMessagesJson<MirrorMessagePage>(
-                    path,
-                    config.IDENTITY_TOPIC_ID,
-                    fetchOptions
-                );
-            } catch (error) {
-                const status = typeof error === 'object' && error !== null && 'status' in error
-                    ? Number((error as { status: unknown }).status)
-                    : null;
-                if (status !== 429 || retries >= CURRENTNESS_MAX_429_RETRIES_PER_PAGE) throw error;
-
-                const providedRetryAfterMs = typeof error === 'object' && error !== null && 'retryAfterMs' in error
-                    ? Number((error as { retryAfterMs: unknown }).retryAfterMs)
-                    : NaN;
-                const retryWaitMs = Math.max(
-                    MIRROR_MIN_REQUEST_INTERVAL_MS,
-                    Number.isFinite(providedRetryAfterMs) && providedRetryAfterMs >= 0
-                        ? Math.ceil(providedRetryAfterMs)
-                        : MIRROR_MIN_REQUEST_INTERVAL_MS
-                );
-                if (
-                    retryWaitMs > CURRENTNESS_MAX_RETRY_AFTER_MS ||
-                    totalRetryWaitMs + retryWaitMs > CURRENTNESS_MAX_TOTAL_RETRY_WAIT_MS
-                ) {
-                    throw error;
-                }
-
-                totalRetryWaitMs += retryWaitMs;
-                retries++;
-                await delay(retryWaitMs);
-            }
-        }
+        return fetchMirrorTopicMessagesJson<MirrorMessagePage>(
+            path,
+            config.IDENTITY_TOPIC_ID,
+            fetchOptions
+        );
     };
 };
 

@@ -26,7 +26,7 @@ describe('fetchMirrorJson status preservation', () => {
         global.fetch = jest.fn();
     });
 
-    it.each([401, 403, 404, 400, 429, 503])(
+    it.each([401, 403, 404, 400, 503])(
         'preserves Mirror HTTP status %s for policy classification',
         async status => {
             (global.fetch as jest.Mock).mockResolvedValue({ ok: false, status });
@@ -37,23 +37,57 @@ describe('fetchMirrorJson status preservation', () => {
                     status
                 })
             );
+            expect(global.fetch).toHaveBeenCalledTimes(1);
         }
     );
 
-    it('preserves a numeric Retry-After value for bounded rate-limit recovery', async () => {
-        (global.fetch as jest.Mock).mockResolvedValue({
-            ok: false,
-            status: 429,
-            headers: new Headers({ 'retry-after': '2' })
+    it('honors numeric Retry-After and succeeds on a bounded 429 retry', async () => {
+        jest.useFakeTimers();
+        const startedAt: number[] = [];
+        (global.fetch as jest.Mock).mockImplementation(async () => {
+            startedAt.push(Date.now());
+            if (startedAt.length === 1) {
+                return new Response('', { status: 429, headers: { 'retry-after': '1' } });
+            }
+            return new Response(JSON.stringify({ account: '0.0.101' }));
         });
 
-        await expect(fetchMirrorJson('/topics/0.0.999/messages')).rejects.toEqual(
-            expect.objectContaining<Partial<MirrorNodeHttpError>>({
-                name: 'MirrorNodeHttpError',
-                status: 429,
-                retryAfterMs: 2000
-            })
-        );
+        try {
+            const pending = fetchMirrorJson<{ account: string }>('/accounts/0.0.101');
+            await jest.runAllTimersAsync();
+            await expect(pending).resolves.toEqual({ account: '0.0.101' });
+            expect(startedAt).toHaveLength(2);
+            expect(startedAt[1] - startedAt[0]).toBeGreaterThanOrEqual(1000);
+        } finally {
+            jest.useRealTimers();
+        }
+    });
+
+    it('bounds repeated 429 retries and preserves the final status', async () => {
+        jest.useFakeTimers();
+        const startedAt: number[] = [];
+        (global.fetch as jest.Mock).mockImplementation(async () => {
+            startedAt.push(Date.now());
+            return new Response('', { status: 429, headers: { 'retry-after': '1' } });
+        });
+
+        try {
+            const pending = fetchMirrorJson('/accounts/0.0.101');
+            const failure = expect(pending).rejects.toEqual(
+                expect.objectContaining<Partial<MirrorNodeHttpError>>({
+                    name: 'MirrorNodeHttpError',
+                    status: 429,
+                    retryAfterMs: 1000
+                })
+            );
+            await jest.runAllTimersAsync();
+            await failure;
+            expect(startedAt).toHaveLength(3);
+            expect(startedAt[1] - startedAt[0]).toBeGreaterThanOrEqual(1000);
+            expect(startedAt[2] - startedAt[1]).toBeGreaterThanOrEqual(1000);
+        } finally {
+            jest.useRealTimers();
+        }
     });
 
     it('allows same-origin pagination on the exact configured topic path', async () => {

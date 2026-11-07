@@ -134,6 +134,13 @@ const parseRetryAfterMs = (value: string | null | undefined): number | undefined
     return Number.isFinite(retryAt) ? Math.max(0, retryAt - Date.now()) : undefined;
 };
 
+const MIRROR_MAX_429_RETRIES = 2;
+const MIRROR_MIN_RETRY_WAIT_MS = 1000;
+const MIRROR_MAX_RETRY_AFTER_MS = 5000;
+const MIRROR_MAX_TOTAL_RETRY_WAIT_MS = 10000;
+
+const delayMirrorRetry = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
+
 export type EvmAliasReconciliation =
     | { status: 'resolved'; hederaAccountId: string }
     | { status: 'absent' }
@@ -236,7 +243,7 @@ const readResponseBytes = async (response: Response, maxResponseBytes: number): 
     return Buffer.concat(chunks, totalBytes);
 };
 
-const fetchMirrorUrlJson = async <T>(
+const fetchMirrorUrlJsonOnce = async <T>(
     url: URL,
     options: MirrorTopicMessageFetchOptions = {}
 ): Promise<T> => {
@@ -272,6 +279,41 @@ const fetchMirrorUrlJson = async <T>(
         return JSON.parse(body.toString('utf8')) as T;
     } finally {
         clearTimeout(timeout);
+    }
+};
+
+const fetchMirrorUrlJson = async <T>(
+    url: URL,
+    options: MirrorTopicMessageFetchOptions = {}
+): Promise<T> => {
+    let retries = 0;
+    let totalRetryWaitMs = 0;
+
+    while (true) {
+        try {
+            return await fetchMirrorUrlJsonOnce<T>(url, options);
+        } catch (error) {
+            if (!(error instanceof MirrorNodeHttpError) || error.status !== 429 || retries >= MIRROR_MAX_429_RETRIES) {
+                throw error;
+            }
+
+            const retryWaitMs = Math.max(
+                MIRROR_MIN_RETRY_WAIT_MS,
+                Number.isFinite(error.retryAfterMs) && error.retryAfterMs! >= 0
+                    ? Math.ceil(error.retryAfterMs!)
+                    : MIRROR_MIN_RETRY_WAIT_MS
+            );
+            if (
+                retryWaitMs > MIRROR_MAX_RETRY_AFTER_MS ||
+                totalRetryWaitMs + retryWaitMs > MIRROR_MAX_TOTAL_RETRY_WAIT_MS
+            ) {
+                throw error;
+            }
+
+            retries++;
+            totalRetryWaitMs += retryWaitMs;
+            await delayMirrorRetry(retryWaitMs);
+        }
     }
 };
 
