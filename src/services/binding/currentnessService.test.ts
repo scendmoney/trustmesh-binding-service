@@ -179,9 +179,7 @@ const lifecycle = (
 }, options.privateKey ?? LIFECYCLE_PRIVATE_KEY);
 
 const mockCompleteTopic = (messages: ReturnType<typeof mirrorMessage>[]) => {
-    const newest = [...messages].sort((a, b) => b.sequence_number - a.sequence_number)[0];
     (fetchMirrorTopicMessagesJson as jest.Mock)
-        .mockResolvedValueOnce({ messages: newest ? [newest] : [], links: {} })
         .mockResolvedValueOnce({
             messages: [...messages].sort((a, b) => b.sequence_number - a.sequence_number),
             links: {}
@@ -206,6 +204,12 @@ describe('CurrentnessService conformance', () => {
             coverageComplete: true
         });
         expect(result.validUntil).not.toBe(result.observedAt);
+        expect(fetchMirrorTopicMessagesJson).toHaveBeenCalledTimes(1);
+        expect(fetchMirrorTopicMessagesJson).toHaveBeenCalledWith(
+            '/topics/0.0.999/messages?limit=100&order=desc',
+            '0.0.999',
+            expect.objectContaining({ onResponseBytes: expect.any(Function) })
+        );
     });
 
     it('preserves exact case for DID, stable identifier, and issuer matching', async () => {
@@ -380,7 +384,6 @@ describe('CurrentnessService conformance', () => {
 
     it('returns UNKNOWN_STALE when pagination does not cover the watermark', async () => {
         (fetchMirrorTopicMessagesJson as jest.Mock)
-            .mockResolvedValueOnce({ messages: [mirrorMessage(3, binding('0.0.101'))] })
             .mockResolvedValueOnce({
                 messages: [mirrorMessage(3, binding('0.0.101'))],
                 links: { next: '/page-2' }
@@ -395,6 +398,63 @@ describe('CurrentnessService conformance', () => {
         expect(result.disposition).toBe('UNKNOWN_STALE');
         expect(result.reason).toBe('INCOMPLETE_PAGINATION');
         expect(result.authoritativeWatermark.coverageComplete).toBe(false);
+        expect(fetchMirrorTopicMessagesJson).toHaveBeenCalledTimes(2);
+    });
+
+    it('paces multi-page reads and recovers from a bounded Retry-After 429 with complete coverage', async () => {
+        jest.useFakeTimers();
+        const startedAt: number[] = [];
+        (fetchMirrorTopicMessagesJson as jest.Mock).mockImplementation(async (path: string) => {
+            startedAt.push(Date.now());
+            if (startedAt.length === 1) {
+                return {
+                    messages: [mirrorMessage(3, binding('0.0.101')), mirrorMessage(2, { unrelated: true })],
+                    links: { next: '/page-2' }
+                };
+            }
+            if (startedAt.length === 2) {
+                throw Object.assign(new Error('rate limited'), { status: 429, retryAfterMs: 1000 });
+            }
+            return { messages: [mirrorMessage(1, { unrelated: true })], links: {} };
+        });
+
+        try {
+            const pending = CurrentnessService.read(request);
+            await jest.runAllTimersAsync();
+            const result = await pending;
+
+            expect(result.disposition).toBe('CURRENT');
+            expect(result.authoritativeWatermark).toMatchObject({ sequenceNumber: 3, coverageComplete: true });
+            expect(startedAt).toHaveLength(3);
+            expect(startedAt[1] - startedAt[0]).toBeGreaterThanOrEqual(1000);
+            expect(startedAt[2] - startedAt[1]).toBeGreaterThanOrEqual(1000);
+        } finally {
+            jest.useRealTimers();
+        }
+    });
+
+    it('classifies exhausted 429 retries as TEMPORARY_OUTAGE and never returns CURRENT', async () => {
+        jest.useFakeTimers();
+        const startedAt: number[] = [];
+        (fetchMirrorTopicMessagesJson as jest.Mock).mockImplementation(async () => {
+            startedAt.push(Date.now());
+            throw Object.assign(new Error('rate limited'), { status: 429, retryAfterMs: 1000 });
+        });
+
+        try {
+            const pending = CurrentnessService.read(request);
+            const failure = expect(pending).rejects.toMatchObject({
+                name: 'CurrentnessReadError',
+                code: 'TEMPORARY_OUTAGE'
+            });
+            await jest.runAllTimersAsync();
+            await failure;
+            expect(startedAt).toHaveLength(3);
+            expect(startedAt[1] - startedAt[0]).toBeGreaterThanOrEqual(1000);
+            expect(startedAt[2] - startedAt[1]).toBeGreaterThanOrEqual(1000);
+        } finally {
+            jest.useRealTimers();
+        }
     });
 
     it('deduplicates exact repeated topic sequence messages before coverage and reduction', async () => {
@@ -663,7 +723,7 @@ describe('CurrentnessService conformance', () => {
     it('fails with a typed error when total Mirror messages exceed the read budget', async () => {
         const repeated = mirrorMessage(1, binding('0.0.101'));
         (fetchMirrorTopicMessagesJson as jest.Mock)
-            .mockResolvedValueOnce({ messages: [repeated] })
+            .mockResolvedValueOnce({ messages: [repeated], links: { next: '/page-2' } })
             .mockResolvedValueOnce({
                 messages: Array.from({ length: CURRENTNESS_MAX_TOTAL_MESSAGES }, () => repeated),
                 links: {}

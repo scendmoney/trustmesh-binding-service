@@ -488,7 +488,7 @@ describe('IdentityRegistrationService', () => {
             reason: 'UNCERTAIN_OUTCOME_BLOCKED'
         });
         expect(provisionAccountForEvmAlias).toHaveBeenCalledTimes(1);
-        expect(fetchMirrorTopicMessagesJson).toHaveBeenCalledTimes(6);
+        expect(fetchMirrorTopicMessagesJson).toHaveBeenCalledTimes(3);
     });
 
     it('returns an exact current binding after uncertain provisioning without another provider write', async () => {

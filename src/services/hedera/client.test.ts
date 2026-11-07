@@ -26,7 +26,7 @@ describe('fetchMirrorJson status preservation', () => {
         global.fetch = jest.fn();
     });
 
-    it.each([401, 403, 404, 400, 503])(
+    it.each([401, 403, 404, 400, 429, 503])(
         'preserves Mirror HTTP status %s for policy classification',
         async status => {
             (global.fetch as jest.Mock).mockResolvedValue({ ok: false, status });
@@ -39,6 +39,22 @@ describe('fetchMirrorJson status preservation', () => {
             );
         }
     );
+
+    it('preserves a numeric Retry-After value for bounded rate-limit recovery', async () => {
+        (global.fetch as jest.Mock).mockResolvedValue({
+            ok: false,
+            status: 429,
+            headers: new Headers({ 'retry-after': '2' })
+        });
+
+        await expect(fetchMirrorJson('/topics/0.0.999/messages')).rejects.toEqual(
+            expect.objectContaining<Partial<MirrorNodeHttpError>>({
+                name: 'MirrorNodeHttpError',
+                status: 429,
+                retryAfterMs: 2000
+            })
+        );
+    });
 
     it('allows same-origin pagination on the exact configured topic path', async () => {
         (global.fetch as jest.Mock).mockResolvedValue(new Response(JSON.stringify({ messages: [] })));

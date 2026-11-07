@@ -714,6 +714,66 @@ const classifyReadFailure = (error: unknown): CurrentnessReadError => {
     return new CurrentnessReadError('UPSTREAM_PERMANENT_FAILURE', 'Mirror returned an invalid permanent response.');
 };
 
+const MIRROR_MIN_REQUEST_INTERVAL_MS = 1000;
+const CURRENTNESS_MAX_429_RETRIES_PER_PAGE = 2;
+const CURRENTNESS_MAX_RETRY_AFTER_MS = 5000;
+const CURRENTNESS_MAX_TOTAL_RETRY_WAIT_MS = 10000;
+
+const delay = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
+
+const createCurrentnessPageReader = (
+    fetchOptions: { onResponseBytes: (bytes: number) => void }
+): ((path: string) => Promise<MirrorMessagePage>) => {
+    let lastRequestStartedAt: number | undefined;
+    let totalRetryWaitMs = 0;
+
+    return async (path: string): Promise<MirrorMessagePage> => {
+        let retries = 0;
+        while (true) {
+            const now = Date.now();
+            const nextPacedAt = lastRequestStartedAt === undefined
+                ? now
+                : lastRequestStartedAt + MIRROR_MIN_REQUEST_INTERVAL_MS;
+            const pacingWaitMs = Math.max(0, nextPacedAt - now);
+            if (pacingWaitMs > 0) await delay(pacingWaitMs);
+            lastRequestStartedAt = Date.now();
+
+            try {
+                return await fetchMirrorTopicMessagesJson<MirrorMessagePage>(
+                    path,
+                    config.IDENTITY_TOPIC_ID,
+                    fetchOptions
+                );
+            } catch (error) {
+                const status = typeof error === 'object' && error !== null && 'status' in error
+                    ? Number((error as { status: unknown }).status)
+                    : null;
+                if (status !== 429 || retries >= CURRENTNESS_MAX_429_RETRIES_PER_PAGE) throw error;
+
+                const providedRetryAfterMs = typeof error === 'object' && error !== null && 'retryAfterMs' in error
+                    ? Number((error as { retryAfterMs: unknown }).retryAfterMs)
+                    : NaN;
+                const retryWaitMs = Math.max(
+                    MIRROR_MIN_REQUEST_INTERVAL_MS,
+                    Number.isFinite(providedRetryAfterMs) && providedRetryAfterMs >= 0
+                        ? Math.ceil(providedRetryAfterMs)
+                        : MIRROR_MIN_REQUEST_INTERVAL_MS
+                );
+                if (
+                    retryWaitMs > CURRENTNESS_MAX_RETRY_AFTER_MS ||
+                    totalRetryWaitMs + retryWaitMs > CURRENTNESS_MAX_TOTAL_RETRY_WAIT_MS
+                ) {
+                    throw error;
+                }
+
+                totalRetryWaitMs += retryWaitMs;
+                retries++;
+                await delay(retryWaitMs);
+            }
+        }
+    };
+};
+
 export class CurrentnessService {
     static assertCapability(): void {
         if (
@@ -777,35 +837,45 @@ export class CurrentnessService {
                     );
                 }
             };
-            const fetchOptions = { onResponseBytes };
-            const watermarkPage = await fetchMirrorTopicMessagesJson<MirrorMessagePage>(
-                `/topics/${config.IDENTITY_TOPIC_ID}/messages?limit=1&order=desc`,
-                config.IDENTITY_TOPIC_ID,
-                fetchOptions
+            const readPage = createCurrentnessPageReader({ onResponseBytes });
+            const initialPage = await readPage(
+                `/topics/${config.IDENTITY_TOPIC_ID}/messages?limit=100&order=desc`
             );
-            const watermarkMessages = readPageMessages(watermarkPage);
-            let totalMessages = watermarkMessages.length;
+            const initialMessages = readPageMessages(initialPage);
+            if (initialMessages.some((message, index) =>
+                index > 0 && initialMessages[index - 1].sequence_number < message.sequence_number
+            )) {
+                throw new CurrentnessReadError(
+                    'UPSTREAM_PERMANENT_FAILURE',
+                    'Mirror returned currentness messages outside descending sequence order.'
+                );
+            }
+            let totalMessages = initialMessages.length;
             if (totalMessages > CURRENTNESS_MAX_TOTAL_MESSAGES) {
                 throw new CurrentnessReadError(
                     'UPSTREAM_PERMANENT_FAILURE',
                     'Mirror currentness read exceeded the configured evidence limit.'
                 );
             }
-            const watermark = watermarkMessages[0]?.sequence_number ?? 0;
+            const watermark = initialMessages[0]?.sequence_number ?? 0;
             if (!Number.isSafeInteger(watermark) || watermark < 0) {
                 throw new CurrentnessReadError('UPSTREAM_PERMANENT_FAILURE', 'Mirror topic watermark is invalid.');
             }
 
-            const messages: MirrorMessage[] = [];
-            let next: string | undefined = `/topics/${config.IDENTITY_TOPIC_ID}/messages?limit=100&order=desc`;
-            let pages = 0;
+            const messages: MirrorMessage[] = initialMessages.filter(message => message.sequence_number <= watermark);
+            let next = initialPage.links?.next;
+            let pages = 1;
             while (next && pages < config.RESOLVE_MAX_PAGES) {
-                const page: MirrorMessagePage = await fetchMirrorTopicMessagesJson<MirrorMessagePage>(
-                    next,
-                    config.IDENTITY_TOPIC_ID,
-                    fetchOptions
-                );
+                const page = await readPage(next);
                 const pageMessages = readPageMessages(page);
+                if (pageMessages.some((message, index) =>
+                    index > 0 && pageMessages[index - 1].sequence_number < message.sequence_number
+                )) {
+                    throw new CurrentnessReadError(
+                        'UPSTREAM_PERMANENT_FAILURE',
+                        'Mirror returned currentness messages outside descending sequence order.'
+                    );
+                }
                 totalMessages += pageMessages.length;
                 if (totalMessages > CURRENTNESS_MAX_TOTAL_MESSAGES) {
                     throw new CurrentnessReadError(

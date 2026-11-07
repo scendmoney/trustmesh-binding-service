@@ -113,11 +113,26 @@ const toMirrorUrl = (pathOrUrl: string): URL => {
 };
 
 export class MirrorNodeHttpError extends Error {
-    constructor(public readonly status: number) {
+    constructor(public readonly status: number, public readonly retryAfterMs?: number) {
         super(`Mirror node returned ${status}`);
         this.name = 'MirrorNodeHttpError';
     }
 }
+
+const parseRetryAfterMs = (value: string | null | undefined): number | undefined => {
+    if (typeof value !== 'string' || value.trim() === '') return undefined;
+    const normalized = value.trim();
+    if (/^\d+$/.test(normalized)) {
+        const seconds = Number(normalized);
+        if (Number.isSafeInteger(seconds) && seconds <= Math.floor(Number.MAX_SAFE_INTEGER / 1000)) {
+            return seconds * 1000;
+        }
+        return undefined;
+    }
+
+    const retryAt = Date.parse(normalized);
+    return Number.isFinite(retryAt) ? Math.max(0, retryAt - Date.now()) : undefined;
+};
 
 export type EvmAliasReconciliation =
     | { status: 'resolved'; hederaAccountId: string }
@@ -245,7 +260,11 @@ const fetchMirrorUrlJson = async <T>(
         });
 
         if (!response.ok) {
-            throw new MirrorNodeHttpError(response.status);
+            const retryAfter = response.headers?.get?.('retry-after');
+            throw new MirrorNodeHttpError(
+                response.status,
+                response.status === 429 ? parseRetryAfterMs(retryAfter) : undefined
+            );
         }
 
         const body = await readResponseBytes(response, maxResponseBytes);
