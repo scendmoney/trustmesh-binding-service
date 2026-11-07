@@ -401,20 +401,28 @@ describe('CurrentnessService conformance', () => {
         expect(fetchMirrorTopicMessagesJson).toHaveBeenCalledTimes(2);
     });
 
-    it('paces multi-page reads at one-second intervals with complete coverage', async () => {
+    it('keeps a multi-page result within the initial snapshot validity window', async () => {
         jest.useFakeTimers();
+        const previousValidity = config.CURRENTNESS_VALIDITY_MS;
+        const snapshotValidity = 1500;
+        config.CURRENTNESS_VALIDITY_MS = snapshotValidity;
+        const snapshotObservedAt = Date.now();
         const startedAt: number[] = [];
-        let finalPageCompletedAt: number | undefined;
         (fetchMirrorTopicMessagesJson as jest.Mock).mockImplementation(async () => {
             startedAt.push(Date.now());
             if (startedAt.length === 1) {
                 return {
-                    messages: [mirrorMessage(3, binding('0.0.101')), mirrorMessage(2, { unrelated: true })],
+                    messages: [mirrorMessage(2, binding('0.0.101'))],
                     links: { next: '/page-2' }
                 };
             }
-            finalPageCompletedAt = Date.now();
-            return { messages: [mirrorMessage(1, { unrelated: true })], links: {} };
+            return {
+                messages: [
+                    mirrorMessage(3, lifecycle('IDENTITY_REVOKE', 2)),
+                    mirrorMessage(1, { unrelated: true })
+                ],
+                links: {}
+            };
         });
 
         try {
@@ -423,14 +431,38 @@ describe('CurrentnessService conformance', () => {
             const result = await pending;
 
             expect(result.disposition).toBe('CURRENT');
-            expect(result.authoritativeWatermark).toMatchObject({ sequenceNumber: 3, coverageComplete: true });
+            expect(result.authoritativeWatermark).toMatchObject({ sequenceNumber: 2, coverageComplete: true });
+            expect(result.lifecycle).toBeNull();
             expect(startedAt).toHaveLength(2);
             expect(startedAt[1] - startedAt[0]).toBeGreaterThanOrEqual(1000);
-            expect(finalPageCompletedAt).toBeDefined();
-            expect(Date.parse(result.observedAt)).toBeGreaterThanOrEqual(finalPageCompletedAt!);
-            expect(Date.parse(result.validUntil)).toBeGreaterThan(finalPageCompletedAt!);
+            expect(Date.parse(result.observedAt)).toBe(snapshotObservedAt);
+            expect(Date.parse(result.validUntil)).toBe(snapshotObservedAt + snapshotValidity);
+            expect(Date.now()).toBe(snapshotObservedAt + 1000);
+            expect(Date.parse(result.validUntil) - Date.now()).toBe(500);
         } finally {
             jest.useRealTimers();
+            config.CURRENTNESS_VALIDITY_MS = previousValidity;
+        }
+    });
+
+    it('fails closed when page pacing would outlive the initial snapshot validity deadline', async () => {
+        jest.useFakeTimers();
+        const previousValidity = config.CURRENTNESS_VALIDITY_MS;
+        config.CURRENTNESS_VALIDITY_MS = 500;
+        (fetchMirrorTopicMessagesJson as jest.Mock).mockResolvedValueOnce({
+            messages: [mirrorMessage(2, binding('0.0.101'))],
+            links: { next: '/page-2' }
+        });
+
+        try {
+            await expect(CurrentnessService.read(request)).rejects.toMatchObject({
+                name: 'CurrentnessReadError',
+                code: 'TIMEOUT'
+            });
+            expect(fetchMirrorTopicMessagesJson).toHaveBeenCalledTimes(1);
+        } finally {
+            jest.useRealTimers();
+            config.CURRENTNESS_VALIDITY_MS = previousValidity;
         }
     });
 

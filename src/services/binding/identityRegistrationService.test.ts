@@ -378,46 +378,74 @@ describe('IdentityRegistrationService', () => {
         }
     });
 
-    it('anchors validity after a retried multi-page currentness scan', async () => {
+    it('fails registration closed when Retry-After exceeds the initial snapshot validity deadline', async () => {
         const previousValidity = config.CURRENTNESS_VALIDITY_MS;
         config.CURRENTNESS_VALIDITY_MS = 500;
         const previousFetch = global.fetch;
-        const requests: Array<{ path: string; at: number }> = [];
-        let topicRequestCount = 0;
+        const requests: string[] = [];
         global.fetch = jest.fn(async (input: unknown) => {
-            const url = new URL(String(input));
-            requests.push({ path: url.pathname + url.search, at: Date.now() });
-            topicRequestCount += 1;
-            if (topicRequestCount === 1) {
-                return new Response('', { status: 429, headers: { 'retry-after': '1' } });
-            }
-            if (url.searchParams.has('sequence')) {
-                return new Response(JSON.stringify({
-                    messages: [mirrorMessage(1, { unrelated: true })],
-                    links: {}
-                }));
-            }
-            return new Response(JSON.stringify({
-                messages: [mirrorMessage(2, { unrelated: true })],
-                links: { next: '/topics/0.0.999/messages?limit=100&order=desc&sequence=1' }
-            }));
+            requests.push(String(input));
+            return new Response('', { status: 429, headers: { 'retry-after': '1' } });
         }) as unknown as typeof fetch;
         jest.useFakeTimers();
         const realClient = jest.requireActual('../hedera/client') as typeof import('../hedera/client');
         (fetchMirrorTopicMessagesJson as jest.Mock).mockImplementation(realClient.fetchMirrorTopicMessagesJson);
 
         try {
-            const pending = CurrentnessService.read({ requestVersion: 'v1', identity });
-            await jest.runAllTimersAsync();
-            const result = await pending;
+            const result = await register({ ...request, idempotencyKey: 'expired-currentness-retry-window' });
 
-            expect(result.disposition).toBe('UNBOUND');
-            expect(requests).toHaveLength(3);
-            expect(Date.now()).toBeGreaterThanOrEqual(2000);
-            expect(Date.now() - Date.parse(result.observedAt)).toBe(0);
-            expect(Date.parse(result.observedAt)).toBeGreaterThanOrEqual(requests[2].at);
-            expect(Date.parse(result.validUntil)).toBeGreaterThan(Date.now());
+            expect(result).toMatchObject({
+                status: 'pending',
+                reason: 'CURRENTNESS_TEMPORARILY_UNAVAILABLE',
+                retryable: true
+            });
+            expect(requests).toHaveLength(1);
+            expect(reconcileEvmAlias).not.toHaveBeenCalled();
+            expect(provisionAccountForEvmAlias).not.toHaveBeenCalled();
+            expect(submitToTopic).not.toHaveBeenCalled();
         } finally {
+            jest.useRealTimers();
+            global.fetch = previousFetch;
+            config.CURRENTNESS_VALIDITY_MS = previousValidity;
+        }
+    });
+
+    it('expires currentness queued behind a shared Mirror request before dispatch', async () => {
+        const previousValidity = config.CURRENTNESS_VALIDITY_MS;
+        const previousFetch = global.fetch;
+        config.CURRENTNESS_VALIDITY_MS = 500;
+        let releaseHeldRequest!: (response: Response) => void;
+        global.fetch = jest.fn(() => new Promise<Response>(resolve => {
+            releaseHeldRequest = resolve;
+        })) as unknown as typeof fetch;
+        jest.useFakeTimers();
+        const realClient = jest.requireActual('../hedera/client') as typeof import('../hedera/client');
+        (fetchMirrorTopicMessagesJson as jest.Mock).mockImplementation(realClient.fetchMirrorTopicMessagesJson);
+
+        try {
+            const heldRequest = realClient.fetchMirrorJson('/accounts/held');
+            await Promise.resolve();
+            await Promise.resolve();
+            expect(global.fetch).toHaveBeenCalledTimes(1);
+
+            const registration = register({ ...request, idempotencyKey: 'currentness-scheduler-deadline' });
+            for (let turn = 0; turn < 6; turn += 1) await Promise.resolve();
+            expect(fetchMirrorTopicMessagesJson).toHaveBeenCalledTimes(1);
+            await jest.advanceTimersByTimeAsync(500);
+            await expect(registration).resolves.toMatchObject({
+                status: 'pending',
+                reason: 'CURRENTNESS_TEMPORARILY_UNAVAILABLE',
+                retryable: true
+            });
+            expect(global.fetch).toHaveBeenCalledTimes(1);
+            expect(reconcileEvmAlias).not.toHaveBeenCalled();
+            expect(provisionAccountForEvmAlias).not.toHaveBeenCalled();
+            expect(submitToTopic).not.toHaveBeenCalled();
+
+            releaseHeldRequest(new Response(JSON.stringify({ account: '0.0.701' })));
+            await expect(heldRequest).resolves.toEqual({ account: '0.0.701' });
+        } finally {
+            if (releaseHeldRequest) releaseHeldRequest(new Response(JSON.stringify({ account: '0.0.701' })));
             jest.useRealTimers();
             global.fetch = previousFetch;
             config.CURRENTNESS_VALIDITY_MS = previousValidity;

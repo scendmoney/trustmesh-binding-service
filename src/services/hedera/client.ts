@@ -44,13 +44,16 @@ export type MirrorNodeRequestPolicyCode =
     | 'MIRROR_RESPONSE_TOO_LARGE'
     | 'MIRROR_SCHEDULER_CAPACITY'
     | 'MIRROR_SCHEDULER_TIMEOUT'
-    | 'MIRROR_SCHEDULER_ORIGIN_LIMIT';
+    | 'MIRROR_SCHEDULER_ORIGIN_LIMIT'
+    | 'MIRROR_READ_DEADLINE_EXCEEDED';
 
 export const MIRROR_MAX_RESPONSE_BYTES = 1024 * 1024;
 
 export interface MirrorTopicMessageFetchOptions {
     maxResponseBytes?: number;
     onResponseBytes?: (bytes: number) => void;
+    /** Absolute caller-owned deadline; currentness uses its original snapshot validity boundary. */
+    deadlineAt?: number;
 }
 
 export class MirrorNodeRequestPolicyError extends Error {
@@ -147,6 +150,16 @@ export const MIRROR_SCHEDULER_MAX_WAIT_MS = 30000;
 const MIRROR_SCHEDULER_MAX_ORIGINS = 8;
 
 const delayMirrorRetry = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
+const mirrorReadDeadlineError = (): MirrorNodeRequestPolicyError =>
+    new MirrorNodeRequestPolicyError('MIRROR_READ_DEADLINE_EXCEEDED', 'Mirror read exceeded its currentness validity deadline.');
+
+const assertMirrorDeadline = (deadlineAt?: number): void => {
+    if (deadlineAt === undefined) return;
+    if (!Number.isSafeInteger(deadlineAt)) {
+        throw new MirrorNodeRequestPolicyError('MIRROR_CONFIG_INVALID', 'Mirror read deadline is invalid.');
+    }
+    if (Date.now() >= deadlineAt) throw mirrorReadDeadlineError();
+};
 
 interface ScheduledMirrorRequest {
     run: () => Promise<unknown>;
@@ -155,6 +168,7 @@ interface ScheduledMirrorRequest {
     enqueuedAt: number;
     started: boolean;
     expired: boolean;
+    deadlineAt?: number;
     waitTimer?: ReturnType<typeof setTimeout>;
 }
 
@@ -167,6 +181,8 @@ interface MirrorOriginSchedule {
 }
 
 const mirrorOriginSchedules = new Map<string, MirrorOriginSchedule>();
+// The Hgraph key is process configuration. This release is attested as one Railway replica,
+// so this process-local scheduler covers the key's topic and account reads.
 
 const schedulerError = (code: Extract<MirrorNodeRequestPolicyCode, `MIRROR_SCHEDULER_${string}`>): MirrorNodeRequestPolicyError =>
     new MirrorNodeRequestPolicyError(code, 'Mirror request capacity or pacing boundary was reached.');
@@ -185,6 +201,15 @@ const pumpMirrorOriginSchedule = (origin: string, schedule: MirrorOriginSchedule
     const start = (): void => {
         schedule.startTimer = undefined;
         if (schedule.scheduled !== request || request.expired) return;
+        if (request.deadlineAt !== undefined && Date.now() >= request.deadlineAt) {
+            request.expired = true;
+            schedule.scheduled = undefined;
+            if (request.waitTimer) clearTimeout(request.waitTimer);
+            request.waitTimer = undefined;
+            request.reject(mirrorReadDeadlineError());
+            pumpMirrorOriginSchedule(origin, schedule);
+            return;
+        }
         if (Date.now() - request.enqueuedAt >= MIRROR_SCHEDULER_MAX_WAIT_MS) {
             request.expired = true;
             schedule.scheduled = undefined;
@@ -212,7 +237,12 @@ const pumpMirrorOriginSchedule = (origin: string, schedule: MirrorOriginSchedule
     else schedule.startTimer = setTimeout(start, waitMs);
 };
 
-const runScheduledMirrorRequest = <T>(origin: string, run: () => Promise<T>): Promise<T> => {
+const runScheduledMirrorRequest = <T>(
+    origin: string,
+    run: () => Promise<T>,
+    deadlineAt?: number
+): Promise<T> => {
+    assertMirrorDeadline(deadlineAt);
     let schedule = mirrorOriginSchedules.get(origin);
     if (!schedule) {
         if (mirrorOriginSchedules.size >= MIRROR_SCHEDULER_MAX_ORIGINS) {
@@ -234,8 +264,10 @@ const runScheduledMirrorRequest = <T>(origin: string, run: () => Promise<T>): Pr
             reject,
             enqueuedAt: Date.now(),
             started: false,
-            expired: false
+            expired: false,
+            deadlineAt
         };
+        const remainingDeadlineMs = deadlineAt === undefined ? Infinity : Math.max(0, deadlineAt - Date.now());
         request.waitTimer = setTimeout(() => {
             if (request.started || request.expired) return;
             request.expired = true;
@@ -246,9 +278,11 @@ const runScheduledMirrorRequest = <T>(origin: string, run: () => Promise<T>): Pr
                 schedule!.startTimer = undefined;
                 schedule!.scheduled = undefined;
             }
-            reject(schedulerError('MIRROR_SCHEDULER_TIMEOUT'));
+            reject(deadlineAt !== undefined && Date.now() >= deadlineAt
+                ? mirrorReadDeadlineError()
+                : schedulerError('MIRROR_SCHEDULER_TIMEOUT'));
             pumpMirrorOriginSchedule(origin, schedule!);
-        }, MIRROR_SCHEDULER_MAX_WAIT_MS);
+        }, Math.min(MIRROR_SCHEDULER_MAX_WAIT_MS, remainingDeadlineMs));
         schedule!.queue.push(request);
         pumpMirrorOriginSchedule(origin, schedule!);
     });
@@ -381,8 +415,12 @@ const fetchMirrorUrlJsonOnce = async <T>(
         throw new MirrorNodeRequestPolicyError('MIRROR_CONFIG_INVALID', 'Mirror response limit is invalid.');
     }
 
+    assertMirrorDeadline(options.deadlineAt);
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), config.MIRROR_NODE_TIMEOUT_MS);
+    const timeoutMs = options.deadlineAt === undefined
+        ? config.MIRROR_NODE_TIMEOUT_MS
+        : Math.min(config.MIRROR_NODE_TIMEOUT_MS, options.deadlineAt - Date.now());
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
     try {
         const response = await fetch(url, {
@@ -390,6 +428,7 @@ const fetchMirrorUrlJsonOnce = async <T>(
             signal: controller.signal,
             redirect: 'error'
         });
+        assertMirrorDeadline(options.deadlineAt);
 
         if (!response.ok) {
             const retryAfter = response.headers?.get?.('retry-after');
@@ -400,6 +439,7 @@ const fetchMirrorUrlJsonOnce = async <T>(
         }
 
         const body = await readResponseBytes(response, maxResponseBytes);
+        assertMirrorDeadline(options.deadlineAt);
         options.onResponseBytes?.(body.byteLength);
         return JSON.parse(body.toString('utf8')) as T;
     } finally {
@@ -415,9 +455,15 @@ const fetchMirrorUrlJson = async <T>(
     let totalRetryWaitMs = 0;
 
     while (true) {
+        assertMirrorDeadline(options.deadlineAt);
         try {
-            return await runScheduledMirrorRequest(url.origin, () => fetchMirrorUrlJsonOnce<T>(url, options));
+            return await runScheduledMirrorRequest(
+                url.origin,
+                () => fetchMirrorUrlJsonOnce<T>(url, options),
+                options.deadlineAt
+            );
         } catch (error) {
+            assertMirrorDeadline(options.deadlineAt);
             if (!(error instanceof MirrorNodeHttpError) || error.status !== 429 || retries >= MIRROR_MAX_429_RETRIES) {
                 throw error;
             }
@@ -428,6 +474,9 @@ const fetchMirrorUrlJson = async <T>(
                     ? Math.ceil(error.retryAfterMs!)
                     : MIRROR_MIN_RETRY_WAIT_MS
             );
+            if (options.deadlineAt !== undefined && Date.now() + retryWaitMs >= options.deadlineAt) {
+                throw mirrorReadDeadlineError();
+            }
             if (
                 retryWaitMs > MIRROR_MAX_RETRY_AFTER_MS ||
                 totalRetryWaitMs + retryWaitMs > MIRROR_MAX_TOTAL_RETRY_WAIT_MS
@@ -438,6 +487,7 @@ const fetchMirrorUrlJson = async <T>(
             retries++;
             totalRetryWaitMs += retryWaitMs;
             await delayMirrorRetry(retryWaitMs);
+            assertMirrorDeadline(options.deadlineAt);
         }
     }
 };

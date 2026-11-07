@@ -683,6 +683,9 @@ const classifyReadFailure = (error: unknown): CurrentnessReadError => {
     if (policyCode === 'MIRROR_CONFIG_INVALID') {
         return new CurrentnessReadError('CAPABILITY_ABSENT', 'Configured Mirror URL is invalid.');
     }
+    if (policyCode === 'MIRROR_READ_DEADLINE_EXCEEDED') {
+        return new CurrentnessReadError('TIMEOUT', 'Mirror currentness read exceeded its validity deadline.');
+    }
     if (policyCode.startsWith('MIRROR_SCHEDULER_')) {
         return new CurrentnessReadError('TEMPORARY_OUTAGE', 'Mirror request pacing capacity is temporarily unavailable.');
     }
@@ -721,25 +724,38 @@ const MIRROR_MIN_REQUEST_INTERVAL_MS = 1000;
 
 const delay = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
 
+const assertCurrentnessDeadline = (deadlineAt: number): void => {
+    if (Date.now() >= deadlineAt) {
+        throw new CurrentnessReadError('TIMEOUT', 'Currentness read exceeded its snapshot validity deadline.');
+    }
+};
+
 const createCurrentnessPageReader = (
-    fetchOptions: { onResponseBytes: (bytes: number) => void }
+    fetchOptions: { onResponseBytes: (bytes: number) => void; deadlineAt: number }
 ): ((path: string) => Promise<MirrorMessagePage>) => {
     let lastRequestStartedAt: number | undefined;
 
     return async (path: string): Promise<MirrorMessagePage> => {
+        assertCurrentnessDeadline(fetchOptions.deadlineAt);
         const now = Date.now();
         const nextPacedAt = lastRequestStartedAt === undefined
             ? now
             : lastRequestStartedAt + MIRROR_MIN_REQUEST_INTERVAL_MS;
         const pacingWaitMs = Math.max(0, nextPacedAt - now);
+        if (pacingWaitMs >= fetchOptions.deadlineAt - now) {
+            throw new CurrentnessReadError('TIMEOUT', 'Currentness pacing would exceed the snapshot validity deadline.');
+        }
         if (pacingWaitMs > 0) await delay(pacingWaitMs);
+        assertCurrentnessDeadline(fetchOptions.deadlineAt);
         lastRequestStartedAt = Date.now();
 
-        return fetchMirrorTopicMessagesJson<MirrorMessagePage>(
+        const page = await fetchMirrorTopicMessagesJson<MirrorMessagePage>(
             path,
             config.IDENTITY_TOPIC_ID,
             fetchOptions
         );
+        assertCurrentnessDeadline(fetchOptions.deadlineAt);
+        return page;
     };
 };
 
@@ -749,7 +765,9 @@ export class CurrentnessService {
             config.RESOLVE_MAX_PAGES_VALID === false ||
             !Number.isSafeInteger(config.RESOLVE_MAX_PAGES) ||
             config.RESOLVE_MAX_PAGES <= 0 ||
-            config.RESOLVE_MAX_PAGES > RESOLVE_MAX_PAGES_HARD_MAX
+            config.RESOLVE_MAX_PAGES > RESOLVE_MAX_PAGES_HARD_MAX ||
+            !Number.isSafeInteger(config.CURRENTNESS_VALIDITY_MS) ||
+            config.CURRENTNESS_VALIDITY_MS <= 0
         ) {
             throw new CurrentnessReadError(
                 'CAPABILITY_ABSENT',
@@ -787,6 +805,11 @@ export class CurrentnessService {
 
     static async read(request: CurrentnessRequest): Promise<CurrentnessResponse> {
         this.assertCapability();
+        const observedAt = new Date().toISOString();
+        const deadlineAt = Date.parse(observedAt) + config.CURRENTNESS_VALIDITY_MS;
+        if (!Number.isSafeInteger(deadlineAt) || !Number.isFinite(new Date(deadlineAt).getTime())) {
+            throw new CurrentnessReadError('CAPABILITY_ABSENT', 'Currentness validity window is not configured safely.');
+        }
 
         try {
             let totalResponseBytes = 0;
@@ -805,7 +828,7 @@ export class CurrentnessService {
                     );
                 }
             };
-            const readPage = createCurrentnessPageReader({ onResponseBytes });
+            const readPage = createCurrentnessPageReader({ onResponseBytes, deadlineAt });
             const initialPage = await readPage(
                 `/topics/${config.IDENTITY_TOPIC_ID}/messages?limit=100&order=desc`
             );
@@ -861,8 +884,10 @@ export class CurrentnessService {
             const coverageComplete = sequenceStream.valid && !next && seen.size === watermark &&
                 [...seen].every(sequence => Number.isSafeInteger(sequence) && sequence >= 1 && sequence <= watermark);
 
-            const observedAt = new Date().toISOString();
-            return reduceCurrentness(request, sequenceStream.messages, observedAt, watermark, coverageComplete);
+            assertCurrentnessDeadline(deadlineAt);
+            const result = reduceCurrentness(request, sequenceStream.messages, observedAt, watermark, coverageComplete);
+            assertCurrentnessDeadline(deadlineAt);
+            return result;
         } catch (error) {
             throw classifyReadFailure(error);
         }
