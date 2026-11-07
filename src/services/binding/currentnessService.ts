@@ -26,7 +26,7 @@ type MirrorMessage = {
 
 type MirrorMessagePage = {
     messages?: MirrorMessage[];
-    links?: { next?: string };
+    links?: { next?: string | null };
 };
 
 const readPageMessages = (page: MirrorMessagePage): MirrorMessage[] => {
@@ -47,10 +47,13 @@ const readPageMessages = (page: MirrorMessagePage): MirrorMessage[] => {
         throw new CurrentnessReadError('UPSTREAM_PERMANENT_FAILURE', 'Mirror returned an invalid currentness page.');
     }
     const links = (page as MirrorMessagePage & { links?: unknown }).links;
+    const nextLink = links && typeof links === 'object' && !Array.isArray(links)
+        ? (links as { next?: unknown }).next
+        : undefined;
     if (
         links !== undefined &&
         (!links || typeof links !== 'object' || Array.isArray(links) ||
-            ((links as { next?: unknown }).next !== undefined && typeof (links as { next?: unknown }).next !== 'string'))
+            (nextLink !== undefined && nextLink !== null && typeof nextLink !== 'string'))
     ) {
         throw new CurrentnessReadError('UPSTREAM_PERMANENT_FAILURE', 'Mirror returned an invalid currentness page.');
     }
@@ -854,7 +857,7 @@ export class CurrentnessService {
             }
 
             const messages: MirrorMessage[] = initialMessages.filter(message => message.sequence_number <= watermark);
-            let next = initialPage.links?.next;
+            let next = initialPage.links?.next ?? undefined;
             let pages = 1;
             while (next && pages < config.RESOLVE_MAX_PAGES) {
                 const page = await readPage(next);
@@ -875,7 +878,7 @@ export class CurrentnessService {
                     );
                 }
                 messages.push(...pageMessages.filter(message => message.sequence_number <= watermark));
-                next = page.links?.next;
+                next = page.links?.next ?? undefined;
                 pages++;
             }
 

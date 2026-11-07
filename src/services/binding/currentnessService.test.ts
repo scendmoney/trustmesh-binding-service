@@ -401,6 +401,63 @@ describe('CurrentnessService conformance', () => {
         expect(fetchMirrorTopicMessagesJson).toHaveBeenCalledTimes(2);
     });
 
+    it('accepts a null continuation on a complete terminal page', async () => {
+        (fetchMirrorTopicMessagesJson as jest.Mock).mockResolvedValueOnce({
+            messages: [mirrorMessage(2, binding('0.0.101')), mirrorMessage(1, { unrelated: true })],
+            links: { next: null }
+        });
+
+        const result = await CurrentnessService.read(request);
+
+        expect(result.disposition).toBe('CURRENT');
+        expect(result.authoritativeWatermark).toMatchObject({ sequenceNumber: 2, coverageComplete: true });
+        expect(fetchMirrorTopicMessagesJson).toHaveBeenCalledTimes(1);
+    });
+
+    it('keeps coverage incomplete when a null terminal link leaves a watermark sequence missing', async () => {
+        jest.useFakeTimers();
+        (fetchMirrorTopicMessagesJson as jest.Mock)
+            .mockResolvedValueOnce({
+                messages: [mirrorMessage(3, binding('0.0.101'))],
+                links: { next: '/page-2' }
+            })
+            .mockResolvedValueOnce({
+                messages: [mirrorMessage(1, { unrelated: true })],
+                links: { next: null }
+            });
+
+        try {
+            const pending = CurrentnessService.read(request);
+            await jest.runAllTimersAsync();
+            const result = await pending;
+
+            expect(result.disposition).toBe('UNKNOWN_STALE');
+            expect(result.reason).toBe('INCOMPLETE_PAGINATION');
+            expect(result.authoritativeWatermark).toMatchObject({ sequenceNumber: 3, coverageComplete: false });
+            expect(fetchMirrorTopicMessagesJson).toHaveBeenCalledTimes(2);
+        } finally {
+            jest.useRealTimers();
+        }
+    });
+
+    it.each([
+        ['number', 7],
+        ['boolean', true],
+        ['object', { href: '/page-2' }],
+        ['array', ['/page-2']]
+    ] as const)('rejects an invalid %s pagination continuation', async (_kind, next) => {
+        (fetchMirrorTopicMessagesJson as jest.Mock).mockResolvedValueOnce({
+            messages: [],
+            links: { next }
+        });
+
+        await expect(CurrentnessService.read(request)).rejects.toMatchObject({
+            name: 'CurrentnessReadError',
+            code: 'UPSTREAM_PERMANENT_FAILURE'
+        });
+        expect(fetchMirrorTopicMessagesJson).toHaveBeenCalledTimes(1);
+    });
+
     it('keeps a multi-page result within the initial snapshot validity window', async () => {
         jest.useFakeTimers();
         const previousValidity = config.CURRENTNESS_VALIDITY_MS;
