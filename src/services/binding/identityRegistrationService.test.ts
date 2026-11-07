@@ -281,6 +281,8 @@ const configureSigner = (privateKey = BINDING_PRIVATE_KEY): void => {
 };
 
 beforeEach(() => {
+    (jest.requireActual('../hedera/client') as typeof import('../hedera/client'))
+        .resetMirrorRequestSchedulerForTests();
     IdentityRegistrationService.resetProcessLocalStateForTests();
     jest.clearAllMocks();
     topicHistory = [];
@@ -311,7 +313,7 @@ beforeEach(() => {
 });
 
 describe('IdentityRegistrationService', () => {
-    it('recovers the immediate alias lookup after UNBOUND currentness on a shared one-request-per-second Mirror key', async () => {
+    it('paces alias lookup after UNBOUND currentness on a shared one-request-per-second Mirror key', async () => {
         const fixture = installMirrorOneRequestPerSecondFixture();
         jest.useFakeTimers();
         const realClient = jest.requireActual('../hedera/client') as typeof import('../hedera/client');
@@ -335,11 +337,9 @@ describe('IdentityRegistrationService', () => {
             expect(result).toMatchObject({ status: 'bound', resolutionSource: 'provider-existing' });
             expect(fixture.requests.map(({ path }) => path)).toEqual([
                 '/api/v1/topics/0.0.999/messages',
-                `/api/v1/accounts/${request.evmPublicAddress.toLowerCase()}`,
                 `/api/v1/accounts/${request.evmPublicAddress.toLowerCase()}`
             ]);
-            expect(fixture.requests[1].startedAt - fixture.requests[0].startedAt).toBeLessThan(1000);
-            expect(fixture.requests[2].startedAt - fixture.requests[1].startedAt).toBeGreaterThanOrEqual(1000);
+            expect(fixture.requests[1].startedAt - fixture.requests[0].startedAt).toBeGreaterThanOrEqual(1000);
             expect(submitToTopic).toHaveBeenCalledTimes(1);
             expect(provisionAccountForEvmAlias).not.toHaveBeenCalled();
         } finally {
@@ -348,6 +348,107 @@ describe('IdentityRegistrationService', () => {
             fixture.restore();
         }
     });
+
+    it('serializes concurrent currentness and alias reads on the shared Mirror origin', async () => {
+        const fixture = installMirrorOneRequestPerSecondFixture();
+        jest.useFakeTimers();
+        const realClient = jest.requireActual('../hedera/client') as typeof import('../hedera/client');
+        (fetchMirrorTopicMessagesJson as jest.Mock).mockImplementation(realClient.fetchMirrorTopicMessagesJson);
+
+        try {
+            const concurrentReads = Promise.all([
+                CurrentnessService.read({ requestVersion: 'v1', identity }),
+                realClient.reconcileEvmAlias(request.evmPublicAddress)
+            ]);
+            await jest.runAllTimersAsync();
+            const [currentness, alias] = await concurrentReads;
+
+            expect(currentness.disposition).toBe('UNBOUND');
+            expect(alias).toEqual({ status: 'resolved', hederaAccountId: '0.0.701' });
+            expect(fixture.requests.map(({ path }) => path)).toEqual([
+                '/api/v1/topics/0.0.999/messages',
+                `/api/v1/accounts/${request.evmPublicAddress.toLowerCase()}`
+            ]);
+            expect(fixture.requests[1].startedAt - fixture.requests[0].startedAt).toBeGreaterThanOrEqual(1000);
+            expect(provisionAccountForEvmAlias).not.toHaveBeenCalled();
+            expect(submitToTopic).not.toHaveBeenCalled();
+        } finally {
+            jest.useRealTimers();
+            fixture.restore();
+        }
+    });
+
+    it('anchors validity after a retried multi-page currentness scan', async () => {
+        const previousValidity = config.CURRENTNESS_VALIDITY_MS;
+        config.CURRENTNESS_VALIDITY_MS = 500;
+        const previousFetch = global.fetch;
+        const requests: Array<{ path: string; at: number }> = [];
+        let topicRequestCount = 0;
+        global.fetch = jest.fn(async (input: unknown) => {
+            const url = new URL(String(input));
+            requests.push({ path: url.pathname + url.search, at: Date.now() });
+            topicRequestCount += 1;
+            if (topicRequestCount === 1) {
+                return new Response('', { status: 429, headers: { 'retry-after': '1' } });
+            }
+            if (url.searchParams.has('sequence')) {
+                return new Response(JSON.stringify({
+                    messages: [mirrorMessage(1, { unrelated: true })],
+                    links: {}
+                }));
+            }
+            return new Response(JSON.stringify({
+                messages: [mirrorMessage(2, { unrelated: true })],
+                links: { next: '/topics/0.0.999/messages?limit=100&order=desc&sequence=1' }
+            }));
+        }) as unknown as typeof fetch;
+        jest.useFakeTimers();
+        const realClient = jest.requireActual('../hedera/client') as typeof import('../hedera/client');
+        (fetchMirrorTopicMessagesJson as jest.Mock).mockImplementation(realClient.fetchMirrorTopicMessagesJson);
+
+        try {
+            const pending = CurrentnessService.read({ requestVersion: 'v1', identity });
+            await jest.runAllTimersAsync();
+            const result = await pending;
+
+            expect(result.disposition).toBe('UNBOUND');
+            expect(requests).toHaveLength(3);
+            expect(Date.now()).toBeGreaterThanOrEqual(2000);
+            expect(Date.now() - Date.parse(result.observedAt)).toBe(0);
+            expect(Date.parse(result.observedAt)).toBeGreaterThanOrEqual(requests[2].at);
+            expect(Date.parse(result.validUntil)).toBeGreaterThan(Date.now());
+        } finally {
+            jest.useRealTimers();
+            global.fetch = previousFetch;
+            config.CURRENTNESS_VALIDITY_MS = previousValidity;
+        }
+    });
+
+    it.each(['UNBOUND', 'CURRENT'] as const)(
+        'rejects expired %s currentness before alias, provisioning, or binding effects',
+        async disposition => {
+            if (disposition === 'CURRENT') pushTopicEvent(signedEvidence());
+            const original = await CurrentnessService.read({ requestVersion: 'v1', identity });
+            expect(original.disposition).toBe(disposition);
+            const expired = { ...original, validUntil: '2000-01-01T00:00:00.000Z' };
+            const currentnessSpy = jest.spyOn(CurrentnessService, 'read').mockResolvedValue(expired);
+
+            try {
+                const result = await register({ ...request, idempotencyKey: `expired-${disposition.toLowerCase()}` });
+
+                expect(result).toMatchObject({
+                    status: 'pending',
+                    reason: 'CURRENTNESS_TEMPORARILY_UNAVAILABLE',
+                    retryable: true
+                });
+                expect(reconcileEvmAlias).not.toHaveBeenCalled();
+                expect(provisionAccountForEvmAlias).not.toHaveBeenCalled();
+                expect(submitToTopic).not.toHaveBeenCalled();
+            } finally {
+                currentnessSpy.mockRestore();
+            }
+        }
+    );
 
     it('keeps exhausted alias 429 responses pending and performs no provider writes', async () => {
         const fixture = installMirrorOneRequestPerSecondFixture(true);
@@ -372,6 +473,9 @@ describe('IdentityRegistrationService', () => {
                 `/api/v1/accounts/${request.evmPublicAddress.toLowerCase()}`,
                 `/api/v1/accounts/${request.evmPublicAddress.toLowerCase()}`
             ]);
+            expect(fixture.requests.slice(1).every((entry, index) =>
+                index === 0 || entry.startedAt - fixture.requests[index].startedAt >= 1000
+            )).toBe(true);
             expect(provisionAccountForEvmAlias).not.toHaveBeenCalled();
             expect(submitToTopic).not.toHaveBeenCalled();
         } finally {

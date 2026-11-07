@@ -142,6 +142,20 @@ const exactIdentity = (input: IdentityRegistrationRequestV1) => ({
 const isTopicSequence = (value: string): boolean =>
     /^(?:[1-9]\d*)$/.test(value) && Number.isSafeInteger(Number(value));
 
+const validUntilIsFresh = (value: string): boolean => {
+    const validUntil = Date.parse(value);
+    return Number.isFinite(validUntil) && validUntil > Date.now();
+};
+
+const currentnessIsFresh = (currentness: CurrentnessResponse): boolean =>
+    validUntilIsFresh(currentness.validUntil);
+
+const expiredCurrentness = (): IdentityRegistrationPendingResponseV1 =>
+    pending(
+        'CURRENTNESS_TEMPORARILY_UNAVAILABLE',
+        'The currentness read expired before registration could safely use it.'
+    );
+
 const authorityCheck = (): AuthorityCheck => {
     if (
         !config.BINDING_EVIDENCE_AUTHORITY_ACCOUNT_ID ||
@@ -185,6 +199,12 @@ const readCurrentness = async (input: IdentityRegistrationRequestV1): Promise<Cu
             requestVersion: 'v1',
             identity: exactIdentity(input)
         });
+        if (
+            ['CURRENT', 'UNBOUND'].includes(currentness.disposition) &&
+            !currentnessIsFresh(currentness)
+        ) {
+            return { ok: false, response: expiredCurrentness() };
+        }
         return { ok: true, currentness };
     } catch (error) {
         if (error instanceof CurrentnessReadError && ['TIMEOUT', 'TEMPORARY_OUTAGE'].includes(error.code)) {
@@ -204,6 +224,7 @@ const boundFromCurrentness = (
     input: IdentityRegistrationRequestV1,
     currentness: CurrentnessResponse
 ): IdentityRegistrationResponseV1 => {
+    if (!currentnessIsFresh(currentness)) return expiredCurrentness();
     const binding = currentness.binding;
     if (
         currentness.disposition !== 'CURRENT' ||
@@ -351,9 +372,12 @@ const publishBinding = async (
     input: IdentityRegistrationRequestV1,
     hederaAccountId: string,
     resolutionSource: 'provider-existing' | 'provider-provisioned',
-    signer: ReturnType<typeof getHederaOperatorEvidenceSigner>
+    signer: ReturnType<typeof getHederaOperatorEvidenceSigner>,
+    currentnessValidUntil: string
 ): Promise<IdentityRegistrationResponseV1> => {
+    if (!validUntilIsFresh(currentnessValidUntil)) return expiredCurrentness();
     const event = createEvidence(input, hederaAccountId, resolutionSource, signer);
+    if (!validUntilIsFresh(currentnessValidUntil)) return expiredCurrentness();
     try {
         const receipt = await submitToTopic(config.IDENTITY_TOPIC_ID, JSON.stringify(event));
         const sequenceNumber = receipt.sequenceNumber ?? receipt.topicSequenceNumber;
@@ -386,18 +410,32 @@ const performRegistration = async (
     if (fresh.currentness.disposition !== 'UNBOUND') {
         return blockedOnNonCurrent(fresh.currentness.disposition);
     }
+    if (!currentnessIsFresh(fresh.currentness)) return expiredCurrentness();
 
     const alias = await reconcileEvmAlias(input.evmPublicAddress);
     if (alias.status === 'unknown') {
         return pending('PROVIDER_OUTCOME_UNCERTAIN', 'Provider identity could not be reconciled safely.');
     }
     if (alias.status === 'resolved') {
-        return publishBinding(input, alias.hederaAccountId, 'provider-existing', authority.signer);
+        return publishBinding(
+            input,
+            alias.hederaAccountId,
+            'provider-existing',
+            authority.signer,
+            fresh.currentness.validUntil
+        );
     }
 
     try {
+        if (!currentnessIsFresh(fresh.currentness)) return expiredCurrentness();
         const provisioned = await provisionAccountForEvmAlias(input.evmPublicAddress);
-        return publishBinding(input, provisioned.hederaAccountId, 'provider-provisioned', authority.signer);
+        return publishBinding(
+            input,
+            provisioned.hederaAccountId,
+            'provider-provisioned',
+            authority.signer,
+            fresh.currentness.validUntil
+        );
     } catch {
         return reconcileAfterUncertainProvision(input);
     }

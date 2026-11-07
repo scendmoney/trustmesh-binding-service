@@ -2,8 +2,12 @@ import {
     fetchMirrorJson,
     fetchMirrorTopicMessagesJson,
     MIRROR_MAX_RESPONSE_BYTES,
+    MIRROR_REQUEST_START_INTERVAL_MS,
+    MIRROR_SCHEDULER_MAX_OUTSTANDING_PER_ORIGIN,
+    MIRROR_SCHEDULER_MAX_WAIT_MS,
     MirrorNodeHttpError,
-    MirrorNodeRequestPolicyError
+    MirrorNodeRequestPolicyError,
+    resetMirrorRequestSchedulerForTests
 } from './client';
 import { config } from '../../config';
 
@@ -23,6 +27,7 @@ jest.mock('../../util/log', () => ({
 
 describe('fetchMirrorJson status preservation', () => {
     beforeEach(() => {
+        resetMirrorRequestSchedulerForTests();
         global.fetch = jest.fn();
     });
 
@@ -85,6 +90,77 @@ describe('fetchMirrorJson status preservation', () => {
             expect(startedAt).toHaveLength(3);
             expect(startedAt[1] - startedAt[0]).toBeGreaterThanOrEqual(1000);
             expect(startedAt[2] - startedAt[1]).toBeGreaterThanOrEqual(1000);
+        } finally {
+            jest.useRealTimers();
+        }
+    });
+
+    it('paces concurrent topic and account reads through one per-origin scheduler', async () => {
+        jest.useFakeTimers();
+        const startedAt: Array<{ path: string; at: number }> = [];
+        (global.fetch as jest.Mock).mockImplementation(async (input: unknown) => {
+            const url = new URL(String(input));
+            startedAt.push({ path: url.pathname, at: Date.now() });
+            return url.pathname.includes('/topics/')
+                ? new Response(JSON.stringify({ messages: [], links: {} }))
+                : new Response(JSON.stringify({ account: '0.0.101' }));
+        });
+
+        try {
+            const reads = Promise.all([
+                fetchMirrorTopicMessagesJson('/topics/0.0.999/messages', '0.0.999'),
+                fetchMirrorJson('/accounts/0.0.101')
+            ]);
+            await jest.runAllTimersAsync();
+            await expect(reads).resolves.toEqual([
+                { messages: [], links: {} },
+                { account: '0.0.101' }
+            ]);
+            expect(startedAt.map(({ path }) => path)).toEqual([
+                '/api/v1/topics/0.0.999/messages',
+                '/api/v1/accounts/0.0.101'
+            ]);
+            expect(startedAt[1].at - startedAt[0].at).toBeGreaterThanOrEqual(MIRROR_REQUEST_START_INTERVAL_MS);
+        } finally {
+            jest.useRealTimers();
+        }
+    });
+
+    it('bounds per-origin queue capacity and wait without dispatching expired requests', async () => {
+        jest.useFakeTimers();
+        let releaseFirst!: (response: Response) => void;
+        (global.fetch as jest.Mock).mockImplementationOnce(() => new Promise<Response>(resolve => {
+            releaseFirst = resolve;
+        }));
+
+        try {
+            const active = fetchMirrorJson('/accounts/active');
+            await Promise.resolve();
+            await Promise.resolve();
+
+            const queued = Array.from(
+                { length: MIRROR_SCHEDULER_MAX_OUTSTANDING_PER_ORIGIN - 1 },
+                (_, index) => fetchMirrorJson(`/accounts/queued-${index}`).then(
+                    () => null,
+                    error => error
+                )
+            );
+            const overflow = await fetchMirrorJson('/accounts/overflow').then(
+                () => null,
+                error => error
+            );
+            expect(overflow).toEqual(expect.objectContaining({ code: 'MIRROR_SCHEDULER_CAPACITY' }));
+
+            await jest.advanceTimersByTimeAsync(MIRROR_SCHEDULER_MAX_WAIT_MS);
+            const expired = await Promise.all(queued);
+            expect(expired).toHaveLength(MIRROR_SCHEDULER_MAX_OUTSTANDING_PER_ORIGIN - 1);
+            expect(expired.every(error =>
+                error instanceof MirrorNodeRequestPolicyError && error.code === 'MIRROR_SCHEDULER_TIMEOUT'
+            )).toBe(true);
+            expect(global.fetch).toHaveBeenCalledTimes(1);
+
+            releaseFirst(new Response(JSON.stringify({ account: '0.0.100' })));
+            await expect(active).resolves.toEqual({ account: '0.0.100' });
         } finally {
             jest.useRealTimers();
         }

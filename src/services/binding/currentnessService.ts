@@ -683,6 +683,9 @@ const classifyReadFailure = (error: unknown): CurrentnessReadError => {
     if (policyCode === 'MIRROR_CONFIG_INVALID') {
         return new CurrentnessReadError('CAPABILITY_ABSENT', 'Configured Mirror URL is invalid.');
     }
+    if (policyCode.startsWith('MIRROR_SCHEDULER_')) {
+        return new CurrentnessReadError('TEMPORARY_OUTAGE', 'Mirror request pacing capacity is temporarily unavailable.');
+    }
     if (policyCode.startsWith('MIRROR_')) {
         return new CurrentnessReadError('UPSTREAM_PERMANENT_FAILURE', 'Mirror pagination violated the configured read boundary.');
     }
@@ -784,7 +787,6 @@ export class CurrentnessService {
 
     static async read(request: CurrentnessRequest): Promise<CurrentnessResponse> {
         this.assertCapability();
-        const observedAt = new Date().toISOString();
 
         try {
             let totalResponseBytes = 0;
@@ -859,6 +861,7 @@ export class CurrentnessService {
             const coverageComplete = sequenceStream.valid && !next && seen.size === watermark &&
                 [...seen].every(sequence => Number.isSafeInteger(sequence) && sequence >= 1 && sequence <= watermark);
 
+            const observedAt = new Date().toISOString();
             return reduceCurrentness(request, sequenceStream.messages, observedAt, watermark, coverageComplete);
         } catch (error) {
             throw classifyReadFailure(error);

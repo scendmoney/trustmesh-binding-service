@@ -41,7 +41,10 @@ export type MirrorNodeRequestPolicyCode =
     | 'MIRROR_ORIGIN_MISMATCH'
     | 'MIRROR_PATH_MISMATCH'
     | 'MIRROR_TOPIC_MISMATCH'
-    | 'MIRROR_RESPONSE_TOO_LARGE';
+    | 'MIRROR_RESPONSE_TOO_LARGE'
+    | 'MIRROR_SCHEDULER_CAPACITY'
+    | 'MIRROR_SCHEDULER_TIMEOUT'
+    | 'MIRROR_SCHEDULER_ORIGIN_LIMIT';
 
 export const MIRROR_MAX_RESPONSE_BYTES = 1024 * 1024;
 
@@ -138,8 +141,130 @@ const MIRROR_MAX_429_RETRIES = 2;
 const MIRROR_MIN_RETRY_WAIT_MS = 1000;
 const MIRROR_MAX_RETRY_AFTER_MS = 5000;
 const MIRROR_MAX_TOTAL_RETRY_WAIT_MS = 10000;
+export const MIRROR_REQUEST_START_INTERVAL_MS = 1000;
+export const MIRROR_SCHEDULER_MAX_OUTSTANDING_PER_ORIGIN = 16;
+export const MIRROR_SCHEDULER_MAX_WAIT_MS = 30000;
+const MIRROR_SCHEDULER_MAX_ORIGINS = 8;
 
 const delayMirrorRetry = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms));
+
+interface ScheduledMirrorRequest {
+    run: () => Promise<unknown>;
+    resolve: (value: unknown) => void;
+    reject: (error: unknown) => void;
+    enqueuedAt: number;
+    started: boolean;
+    expired: boolean;
+    waitTimer?: ReturnType<typeof setTimeout>;
+}
+
+interface MirrorOriginSchedule {
+    queue: ScheduledMirrorRequest[];
+    nextStartAt: number;
+    running: boolean;
+    scheduled?: ScheduledMirrorRequest;
+    startTimer?: ReturnType<typeof setTimeout>;
+}
+
+const mirrorOriginSchedules = new Map<string, MirrorOriginSchedule>();
+
+const schedulerError = (code: Extract<MirrorNodeRequestPolicyCode, `MIRROR_SCHEDULER_${string}`>): MirrorNodeRequestPolicyError =>
+    new MirrorNodeRequestPolicyError(code, 'Mirror request capacity or pacing boundary was reached.');
+
+const pumpMirrorOriginSchedule = (origin: string, schedule: MirrorOriginSchedule): void => {
+    if (schedule.running || schedule.scheduled || schedule.queue.length === 0) return;
+
+    const request = schedule.queue.shift()!;
+    if (request.expired) {
+        pumpMirrorOriginSchedule(origin, schedule);
+        return;
+    }
+
+    schedule.scheduled = request;
+    const waitMs = Math.max(0, schedule.nextStartAt - Date.now());
+    const start = (): void => {
+        schedule.startTimer = undefined;
+        if (schedule.scheduled !== request || request.expired) return;
+        if (Date.now() - request.enqueuedAt >= MIRROR_SCHEDULER_MAX_WAIT_MS) {
+            request.expired = true;
+            schedule.scheduled = undefined;
+            request.reject(schedulerError('MIRROR_SCHEDULER_TIMEOUT'));
+            pumpMirrorOriginSchedule(origin, schedule);
+            return;
+        }
+
+        if (request.waitTimer) clearTimeout(request.waitTimer);
+        request.waitTimer = undefined;
+        request.started = true;
+        schedule.scheduled = undefined;
+        schedule.running = true;
+        schedule.nextStartAt = Date.now() + MIRROR_REQUEST_START_INTERVAL_MS;
+        Promise.resolve()
+            .then(request.run)
+            .then(request.resolve, request.reject)
+            .finally(() => {
+                schedule.running = false;
+                pumpMirrorOriginSchedule(origin, schedule);
+            });
+    };
+
+    if (waitMs === 0) start();
+    else schedule.startTimer = setTimeout(start, waitMs);
+};
+
+const runScheduledMirrorRequest = <T>(origin: string, run: () => Promise<T>): Promise<T> => {
+    let schedule = mirrorOriginSchedules.get(origin);
+    if (!schedule) {
+        if (mirrorOriginSchedules.size >= MIRROR_SCHEDULER_MAX_ORIGINS) {
+            return Promise.reject(schedulerError('MIRROR_SCHEDULER_ORIGIN_LIMIT'));
+        }
+        schedule = { queue: [], nextStartAt: 0, running: false };
+        mirrorOriginSchedules.set(origin, schedule);
+    }
+
+    const outstanding = schedule.queue.length + Number(schedule.running) + Number(!!schedule.scheduled);
+    if (outstanding >= MIRROR_SCHEDULER_MAX_OUTSTANDING_PER_ORIGIN) {
+        return Promise.reject(schedulerError('MIRROR_SCHEDULER_CAPACITY'));
+    }
+
+    return new Promise<T>((resolve, reject) => {
+        const request: ScheduledMirrorRequest = {
+            run,
+            resolve: value => resolve(value as T),
+            reject,
+            enqueuedAt: Date.now(),
+            started: false,
+            expired: false
+        };
+        request.waitTimer = setTimeout(() => {
+            if (request.started || request.expired) return;
+            request.expired = true;
+            const queuedAt = schedule!.queue.indexOf(request);
+            if (queuedAt >= 0) schedule!.queue.splice(queuedAt, 1);
+            if (schedule!.scheduled === request) {
+                if (schedule!.startTimer) clearTimeout(schedule!.startTimer);
+                schedule!.startTimer = undefined;
+                schedule!.scheduled = undefined;
+            }
+            reject(schedulerError('MIRROR_SCHEDULER_TIMEOUT'));
+            pumpMirrorOriginSchedule(origin, schedule!);
+        }, MIRROR_SCHEDULER_MAX_WAIT_MS);
+        schedule!.queue.push(request);
+        pumpMirrorOriginSchedule(origin, schedule!);
+    });
+};
+
+export const resetMirrorRequestSchedulerForTests = (): void => {
+    if (config.NODE_ENV !== 'test') {
+        throw new Error('Mirror request scheduling state can only be reset in tests.');
+    }
+    if ([...mirrorOriginSchedules.values()].some(schedule =>
+        schedule.running || schedule.scheduled || schedule.queue.length > 0
+    )) {
+        throw new Error('Mirror request scheduling state cannot reset while requests are pending.');
+    }
+    mirrorOriginSchedules.clear();
+};
 
 export type EvmAliasReconciliation =
     | { status: 'resolved'; hederaAccountId: string }
@@ -291,7 +416,7 @@ const fetchMirrorUrlJson = async <T>(
 
     while (true) {
         try {
-            return await fetchMirrorUrlJsonOnce<T>(url, options);
+            return await runScheduledMirrorRequest(url.origin, () => fetchMirrorUrlJsonOnce<T>(url, options));
         } catch (error) {
             if (!(error instanceof MirrorNodeHttpError) || error.status !== 429 || retries >= MIRROR_MAX_429_RETRIES) {
                 throw error;
