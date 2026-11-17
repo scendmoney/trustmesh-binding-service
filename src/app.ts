@@ -135,6 +135,70 @@ export const createApp = () => {
         res.json({ ok: true, service: 'trustmesh-binding-service', version: '1.0.0' });
     });
 
+    app.post('/v1/currentness', currentnessLimiter, async (req, res) => {
+        if (!config.CURRENTNESS_SERVICE_TOKEN) {
+            res.status(503).json({
+                responseVersion: 'v1',
+                status: 'error',
+                code: 'CAPABILITY_ABSENT',
+                message: 'Currentness authentication is not configured.'
+            });
+            return;
+        }
+
+        if (req.header('x-trustmesh-currentness-token') !== config.CURRENTNESS_SERVICE_TOKEN) {
+            res.status(401).json({
+                responseVersion: 'v1',
+                status: 'error',
+                code: 'AUTHENTICATION_FAILURE',
+                message: 'Missing or invalid currentness service token.'
+            });
+            return;
+        }
+
+        try {
+            const body = currentnessSchema.parse(req.body);
+            const result = await CurrentnessService.read(body);
+            res.status(result.disposition === 'AMBIGUOUS' ? 409 : 200).json(result);
+        } catch (error) {
+            if (error instanceof z.ZodError) {
+                res.status(400).json({
+                    responseVersion: 'v1',
+                    status: 'error',
+                    code: 'INVALID_REQUEST',
+                    message: 'Invalid currentness request.',
+                    details: error.errors
+                });
+                return;
+            }
+
+            if (error instanceof CurrentnessReadError) {
+                const status = error.code === 'TIMEOUT'
+                    ? 504
+                    : error.code === 'UPSTREAM_AUTHENTICATION_FAILURE' || error.code === 'UPSTREAM_PERMANENT_FAILURE'
+                        ? 502
+                        : 503;
+                res.status(status).json({
+                    responseVersion: 'v1',
+                    status: 'error',
+                    code: error.code,
+                    message: error.message
+                });
+                return;
+            }
+
+            log.error('Currentness route error', error);
+            res.status(500).json({
+                responseVersion: 'v1',
+                status: 'error',
+                code: 'INTERNAL_FAILURE',
+                message: 'Currentness read failed.'
+            });
+        }
+    });
+
+    if (config.CURRENTNESS_ONLY === 'true') return app;
+
     // 2. Resolve
     app.get('/v1/resolve', generalLimiter, async (req, res) => {
         const worldId = req.query.worldId as string;
@@ -278,68 +342,6 @@ export const createApp = () => {
                 'INTERNAL_FAILURE',
                 'Identity registration failed closed.'
             ));
-        }
-    });
-
-    app.post('/v1/currentness', currentnessLimiter, async (req, res) => {
-        if (!config.CURRENTNESS_SERVICE_TOKEN) {
-            res.status(503).json({
-                responseVersion: 'v1',
-                status: 'error',
-                code: 'CAPABILITY_ABSENT',
-                message: 'Currentness authentication is not configured.'
-            });
-            return;
-        }
-
-        if (req.header('x-trustmesh-currentness-token') !== config.CURRENTNESS_SERVICE_TOKEN) {
-            res.status(401).json({
-                responseVersion: 'v1',
-                status: 'error',
-                code: 'AUTHENTICATION_FAILURE',
-                message: 'Missing or invalid currentness service token.'
-            });
-            return;
-        }
-
-        try {
-            const body = currentnessSchema.parse(req.body);
-            const result = await CurrentnessService.read(body);
-            res.status(result.disposition === 'AMBIGUOUS' ? 409 : 200).json(result);
-        } catch (error) {
-            if (error instanceof z.ZodError) {
-                res.status(400).json({
-                    responseVersion: 'v1',
-                    status: 'error',
-                    code: 'INVALID_REQUEST',
-                    message: 'Invalid currentness request.',
-                    details: error.errors
-                });
-                return;
-            }
-
-            if (error instanceof CurrentnessReadError) {
-                const status = error.code === 'TIMEOUT'
-                    ? 504
-                    : error.code === 'UPSTREAM_AUTHENTICATION_FAILURE' || error.code === 'UPSTREAM_PERMANENT_FAILURE'
-                        ? 502
-                        : 503;
-                res.status(status).json({
-                    responseVersion: 'v1',
-                    status: 'error',
-                    code: error.code,
-                    message: error.message
-                });
-                return;
-            }
-
-            log.error('Currentness route error', error);
-            res.status(500).json({
-                responseVersion: 'v1',
-                status: 'error',
-                code: 'INTERNAL_FAILURE',
-                message: 'Currentness read failed.'
-            });
         }
     });
 

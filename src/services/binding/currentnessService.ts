@@ -1,6 +1,7 @@
 import { config, RESOLVE_MAX_PAGES_HARD_MAX } from '../../config';
 import { fetchMirrorTopicMessagesJson } from '../hedera/client';
 import { computeAddress, verifyMessage } from 'ethers';
+import { z } from 'zod';
 import type {
     BindingReference,
     CurrentnessIdentity,
@@ -22,6 +23,72 @@ type MirrorMessage = {
     sequence_number: number;
     payer_account_id?: string;
     message: string;
+    chunk_info?: unknown;
+};
+
+type EvidenceMessage = MirrorMessage & { referenceSequence: number };
+
+const chunkInfoSchema = z.object({
+    number: z.number().int().min(1).max(CURRENTNESS_MAX_TOTAL_MESSAGES),
+    total: z.number().int().min(1).max(CURRENTNESS_MAX_TOTAL_MESSAGES),
+    initial_transaction_id: z.object({
+        account_id: z.string().regex(/^\d+\.\d+\.\d+$/),
+        transaction_valid_start: z.string().regex(/^\d+\.\d{1,9}$/),
+        nonce: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+        scheduled: z.boolean()
+    })
+});
+
+const reassembleTopicMessages = (messages: MirrorMessage[]): EvidenceMessage[] | null => {
+    const complete: EvidenceMessage[] = [];
+    const groups = new Map<string, { total: number; parts: Map<number, MirrorMessage> }>();
+
+    for (const message of messages) {
+        if (message.chunk_info == null) {
+            complete.push({ ...message, referenceSequence: message.sequence_number });
+            continue;
+        }
+
+        const parsed = chunkInfoSchema.safeParse(message.chunk_info);
+        if (!parsed.success) return null;
+        const { number, total, initial_transaction_id: transaction } = parsed.data;
+        if (number > total) return null;
+        if (total === 1) {
+            complete.push({ ...message, referenceSequence: message.sequence_number });
+            continue;
+        }
+
+        if (message.payer_account_id !== transaction.account_id) return null;
+        const key = JSON.stringify([
+            message.topic_id, transaction.account_id, transaction.transaction_valid_start,
+            transaction.nonce, transaction.scheduled
+        ]);
+        const group = groups.get(key) ?? { total, parts: new Map<number, MirrorMessage>() };
+        if (group.total !== total || group.parts.has(number)) return null;
+        group.parts.set(number, message);
+        groups.set(key, group);
+    }
+
+    for (const { total, parts } of groups.values()) {
+        if (parts.size !== total) return null;
+        const inChunkOrder = [...parts.entries()].sort(([a], [b]) => a - b).map(([, row]) => row);
+        const buffers = inChunkOrder.map(row => Buffer.from(row.message, 'base64'));
+        if (buffers.some((part, index) => !part.length || part.toString('base64') !== inChunkOrder[index].message)) {
+            return null;
+        }
+        const lastInConsensus = inChunkOrder.reduce((last, row) =>
+            row.sequence_number > last.sequence_number ? row : last
+        );
+        // The writer returns the first chunk's transaction receipt. The event
+        // becomes effective once the final part reaches consensus.
+        complete.push({
+            ...lastInConsensus,
+            referenceSequence: inChunkOrder[0].sequence_number,
+            message: Buffer.concat(buffers).toString('base64')
+        });
+    }
+
+    return complete.sort((a, b) => a.sequence_number - b.sequence_number);
 };
 
 type MirrorMessagePage = {
@@ -192,12 +259,12 @@ const consensusIso = (timestamp: string): string => {
 
 const bindingRef = (
     identity: CurrentnessIdentity,
-    message: MirrorMessage
+    message: EvidenceMessage
 ): BindingReference => ({
     ...identity,
     network: config.HEDERA_NETWORK,
     topicId: config.IDENTITY_TOPIC_ID,
-    bindingEventId: `${message.topic_id}:${message.sequence_number}`,
+    bindingEventId: `${message.topic_id}:${message.referenceSequence}`,
     schemaVersion: 1,
     normalizationVersion: 'exact-v1'
 });
@@ -390,6 +457,11 @@ export const reduceCurrentness = (
         return makeResponse('UNKNOWN_STALE', 'INCOMPLETE_PAGINATION', identity, observedAt, watermark, watermarkTimestamp, false);
     }
 
+    const evidence = reassembleTopicMessages(messages);
+    if (!evidence) {
+        return makeResponse('UNKNOWN_STALE', 'INCOMPLETE_EVIDENCE', identity, observedAt, watermark, watermarkTimestamp, false);
+    }
+
     const bindings: BindingRecord[] = [];
     const lifecycle: LifecycleRecord[] = [];
     let unsupportedApplicableEvidence = false;
@@ -411,7 +483,7 @@ export const reduceCurrentness = (
         authorizationBasis: config.LIFECYCLE_AUTHORIZATION_BASIS
     };
 
-    for (const message of messages) {
+    for (const message of evidence) {
         if (message.topic_id !== config.IDENTITY_TOPIC_ID) {
             evidenceScopeMismatch = true;
             continue;

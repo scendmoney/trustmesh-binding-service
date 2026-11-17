@@ -10,8 +10,9 @@ const envSchema = z.object({
     PORT: z.string().default('3002'),
     NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
     HEDERA_NETWORK: z.enum(['mainnet', 'testnet', 'previewnet']).default('testnet'),
-    HEDERA_OPERATOR_ID: z.string().min(1),
-    HEDERA_OPERATOR_KEY: z.string().min(1),
+    CURRENTNESS_ONLY: z.enum(['true', 'false']).default('false'),
+    HEDERA_OPERATOR_ID: z.string().default(''),
+    HEDERA_OPERATOR_KEY: z.string().default(''),
     MIRROR_NODE_URL: z.string().url().default('https://testnet.mirrornode.hedera.com/api/v1'),
     MIRROR_NODE_AUTH_TYPE: z.enum(['none', 'bearer', 'x-api-key']).default('none'),
     MIRROR_NODE_AUTH_TOKEN: z.string().optional(),
@@ -35,6 +36,18 @@ const envSchema = z.object({
     MIRROR_NODE_TIMEOUT_MS: z.coerce.number().default(4000),
     HEDERA_ALIAS_POLL_ATTEMPTS: z.coerce.number().default(12),
     HEDERA_ALIAS_POLL_DELAY_MS: z.coerce.number().default(750),
+}).superRefine((env, context) => {
+    for (const field of ['HEDERA_OPERATOR_ID', 'HEDERA_OPERATOR_KEY'] as const) {
+        if (env.CURRENTNESS_ONLY === 'true' ? env[field].length > 0 : env[field].length === 0) {
+            context.addIssue({
+                code: z.ZodIssueCode.custom,
+                path: [field],
+                message: env.CURRENTNESS_ONLY === 'true'
+                    ? 'Currentness-only deployments must omit Hedera signing credentials.'
+                    : 'Required for binding service deployments.'
+            });
+        }
+    }
 });
 
 const parseEnv = () => {

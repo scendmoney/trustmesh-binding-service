@@ -72,6 +72,23 @@ const mirrorMessage = (
     message: Buffer.from(JSON.stringify(event)).toString('base64')
 });
 
+const chunkedMessage = (sequences: [number, number], event: unknown, payer = '0.0.600') => {
+    const bytes = Buffer.from(JSON.stringify(event));
+    const multibyte = bytes.indexOf(Buffer.from('🚲'));
+    const split = multibyte < 0 ? Math.floor(bytes.length / 2) : multibyte + 1;
+    const initialTransactionId = {
+        account_id: payer,
+        transaction_valid_start: `1700000000.${sequences[0]}`,
+        nonce: 0,
+        scheduled: false
+    };
+    return [bytes.subarray(0, split), bytes.subarray(split)].map((part, index) => ({
+        ...mirrorMessage(sequences[index], event, payer),
+        message: part.toString('base64'),
+        chunk_info: { number: index + 1, total: 2, initial_transaction_id: initialTransactionId }
+    }));
+};
+
 const signEvidence = <T extends { provenance: { signature: string } }>(
     event: T,
     privateKey: string
@@ -210,6 +227,96 @@ describe('CurrentnessService conformance', () => {
             '0.0.999',
             expect.objectContaining({ onResponseBytes: expect.any(Function) })
         );
+    });
+
+    it('verifies a signed binding split across UTF-8 bytes and paginated, interleaved chunks', async () => {
+        const event = binding('0.0.101');
+        event.payload.claim_id = 'claim-🚲';
+        signEvidence(event, BINDING_PRIVATE_KEY);
+        const [first, last] = chunkedMessage([1, 4], event);
+        const [otherFirst, otherLast] = chunkedMessage([2, 3], { type: 'UNRELATED' });
+        const next = '/api/v1/topics/0.0.999/messages?limit=100&order=desc&sequencenumber=lt:3';
+        (fetchMirrorTopicMessagesJson as jest.Mock)
+            .mockResolvedValueOnce({ messages: [last, otherLast], links: { next } })
+            .mockResolvedValueOnce({ messages: [otherFirst, first], links: { next: null } });
+
+        const result = await CurrentnessService.read(request);
+
+        expect(result.disposition).toBe('CURRENT');
+        expect(result.binding).toMatchObject({
+            bindingEventId: '0.0.999:1',
+            effectiveAt: new Date(1700000004 * 1000).toISOString()
+        });
+        expect(result.authoritativeWatermark).toMatchObject({ sequenceNumber: 4, coverageComplete: true });
+    });
+
+    it('preserves first-chunk binding references for a later multipart revocation', async () => {
+        mockCompleteTopic([
+            ...chunkedMessage([1, 2], binding('0.0.101')),
+            ...chunkedMessage([3, 4], lifecycle('IDENTITY_REVOKE', 1), '0.0.700')
+        ]);
+
+        const result = await CurrentnessService.read(request);
+
+        expect(result.disposition).toBe('REVOKED');
+    });
+
+    it('rejects revocation ordered before the target binding was complete', async () => {
+        mockCompleteTopic([
+            ...chunkedMessage([1, 3], binding('0.0.101')),
+            mirrorMessage(2, lifecycle('IDENTITY_REVOKE', 1), '0.0.700')
+        ]);
+
+        await expect(CurrentnessService.read(request)).resolves.toMatchObject({
+            disposition: 'UNKNOWN_STALE', reason: 'INCOMPLETE_EVIDENCE'
+        });
+    });
+
+    it('keeps the result unknown when the watermark ends at the first chunk', async () => {
+        const [first] = chunkedMessage([1, 2], binding('0.0.101'));
+        mockCompleteTopic([first]);
+
+        await expect(CurrentnessService.read(request)).resolves.toMatchObject({
+            disposition: 'UNKNOWN_STALE',
+            reason: 'INCOMPLETE_EVIDENCE',
+            authoritativeWatermark: { sequenceNumber: 1, coverageComplete: false }
+        });
+    });
+
+    it.each(['duplicate ordinal', 'mixed payer', 'conflicting total', 'invalid base64', 'oversized total'] as const)(
+        'fails closed on %s even with a complete physical sequence',
+        async defect => {
+            const [first, last] = chunkedMessage([1, 2], binding('0.0.101'));
+            if (defect === 'duplicate ordinal') last.chunk_info.number = 1;
+            if (defect === 'mixed payer') last.payer_account_id = '0.0.700';
+            if (defect === 'conflicting total') last.chunk_info.total = 3;
+            if (defect === 'invalid base64') last.message += '#';
+            if (defect === 'oversized total') last.chunk_info.total = CURRENTNESS_MAX_TOTAL_MESSAGES + 1;
+            mockCompleteTopic([first, last]);
+
+            await expect(CurrentnessService.read(request)).resolves.toMatchObject({
+                disposition: 'UNKNOWN_STALE', reason: 'INCOMPLETE_EVIDENCE'
+            });
+        }
+    );
+
+    it('applies signature verification to the complete chunked envelope', async () => {
+        mockCompleteTopic(chunkedMessage([1, 2], binding('0.0.101', undefined, undefined, undefined, WRONG_PRIVATE_KEY)));
+
+        await expect(CurrentnessService.read(request)).resolves.toMatchObject({
+            disposition: 'UNKNOWN_STALE', reason: 'UNVERIFIED_WRITER_PROVENANCE'
+        });
+    });
+
+    it('preserves a one-part message with explicit chunk metadata', async () => {
+        const signed = mirrorMessage(1, binding('0.0.101'));
+        const [sample] = chunkedMessage([1, 2], { t: 'sample' });
+        const single = { ...sample, ...signed, chunk_info: { ...sample.chunk_info, total: 1 } };
+        mockCompleteTopic([single]);
+
+        await expect(CurrentnessService.read(request)).resolves.toMatchObject({
+            disposition: 'CURRENT', binding: { bindingEventId: '0.0.999:1' }
+        });
     });
 
     it('preserves exact case for DID, stable identifier, and issuer matching', async () => {
@@ -864,6 +971,40 @@ describe('POST /v1/currentness authentication', () => {
             expect(response.status).toBe(200);
             expect(body).toMatchObject({ responseVersion: 'v1', disposition: 'CURRENT' });
         } finally {
+            await new Promise<void>((resolve, reject) => {
+                server.close(error => error ? reject(error) : resolve());
+            });
+        }
+    });
+
+    it('exposes the authenticated reader and omits commands in currentness-only mode', async () => {
+        const previous = config.CURRENTNESS_ONLY;
+        config.CURRENTNESS_ONLY = 'true';
+        const server = createApp().listen(0, '127.0.0.1');
+        try {
+            await new Promise<void>(resolve => server.once('listening', resolve));
+            const address = server.address();
+            if (!address || typeof address === 'string') throw new Error('Test server did not bind.');
+            const base = `http://127.0.0.1:${address.port}`;
+            mockCompleteTopic([mirrorMessage(1, binding('0.0.101'))]);
+            const read = await fetch(`${base}/v1/currentness`, {
+                method: 'POST',
+                headers: {
+                    'content-type': 'application/json',
+                    'x-trustmesh-currentness-token': 'reader-secret'
+                },
+                body: JSON.stringify(request)
+            });
+            expect(read.status).toBe(200);
+            await expect(read.json()).resolves.toMatchObject({ disposition: 'CURRENT' });
+            for (const path of ['/v1/bind', '/v1/identity-binding/register', '/v2/founder-binding/resolve-or-provision']) {
+                const response = await fetch(`${base}${path}`, { method: 'POST' });
+                expect(response.status).toBe(404);
+            }
+            expect(provisionAccountForEvmAlias).not.toHaveBeenCalled();
+            expect(submitToTopic).not.toHaveBeenCalled();
+        } finally {
+            config.CURRENTNESS_ONLY = previous;
             await new Promise<void>((resolve, reject) => {
                 server.close(error => error ? reject(error) : resolve());
             });
