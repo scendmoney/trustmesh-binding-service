@@ -319,6 +319,17 @@ describe('CurrentnessService conformance', () => {
         });
     });
 
+    it('checks initial transaction payer on an explicit one-part message', async () => {
+        const signed = mirrorMessage(1, binding('0.0.101'));
+        const [sample] = chunkedMessage([1, 2], { t: 'sample' }, '0.0.700');
+        const single = { ...sample, ...signed, chunk_info: { ...sample.chunk_info, total: 1 } };
+        mockCompleteTopic([single]);
+
+        await expect(CurrentnessService.read(request)).resolves.toMatchObject({
+            disposition: 'UNKNOWN_STALE', reason: 'INCOMPLETE_EVIDENCE'
+        });
+    });
+
     it('preserves exact case for DID, stable identifier, and issuer matching', async () => {
         mockCompleteTopic([mirrorMessage(1, binding('0.0.101'))]);
 

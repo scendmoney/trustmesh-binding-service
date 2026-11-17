@@ -53,10 +53,6 @@ const reassembleTopicMessages = (messages: MirrorMessage[]): EvidenceMessage[] |
         if (!parsed.success) return null;
         const { number, total, initial_transaction_id: transaction } = parsed.data;
         if (number > total) return null;
-        if (total === 1) {
-            complete.push({ ...message, referenceSequence: message.sequence_number });
-            continue;
-        }
 
         if (message.payer_account_id !== transaction.account_id) return null;
         const key = JSON.stringify([
